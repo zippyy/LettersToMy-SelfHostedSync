@@ -1,0 +1,23 @@
+# Letters to My — Self-Hosted Sync Server
+#
+# Run: docker compose up -d
+#
+# Provides a REST API for cross-platform syncing, backup storage,
+# and attachment hosting. iOS, Android, and web clients all
+# connect to this server.
+
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - data:/data
+      - ./api_keys.txt:/etc/letters2my/api_keys.txt:ro
+    environment:
+      - DATA_DIR=/data
+      - PORT=8080
+    restart: unless-stopped
+
+volumes:
+  data:

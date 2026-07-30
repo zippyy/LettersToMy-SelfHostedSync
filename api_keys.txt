@@ -1,0 +1,7 @@
+# One key per line: device_name:token
+# Lines starting with # are comments.
+# Generate strong tokens: openssl rand -hex 32
+
+iphone:letters2my
+android:letters2my
+web:letters2my
