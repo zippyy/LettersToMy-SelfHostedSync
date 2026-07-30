@@ -44,6 +44,10 @@ type StatusResponse struct {
 	Syncs       []SyncPayload    `json:"syncs"`
 	Attachments []AttachmentMeta `json:"attachments"`
 	Recoveries  []RecoveryMeta   `json:"recoveries"`
+	Branches    int              `json:"branches"`
+	Folders     int              `json:"folders"`
+	Members     int              `json:"members"`
+	Invitations int              `json:"invitations"`
 }
 
 // ── Collaboration ──
@@ -68,12 +72,36 @@ type Invitation struct {
 	Code      string `json:"code"`
 	CreatedBy string `json:"created_by"`
 	Role      Role   `json:"role"`
+	BranchIDs []string `json:"branch_ids,omitempty"`
+	FolderIDs []string `json:"folder_ids,omitempty"`
 	Expires   int64  `json:"expires"`
+}
+
+// ── Family structure ──
+
+type Branch struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Kind      string   `json:"kind"`      // parents, maternal, paternal, chosenFamily, custom
+	IsSeeded  bool     `json:"is_seeded"`
+	MemberIDs []string `json:"member_ids"` // who has access to this branch
+	CreatedAt int64    `json:"created_at"`
+}
+
+type Folder struct {
+	ID         string   `json:"id"`
+	BranchID   string   `json:"branch_id"`
+	ParentID   string   `json:"parent_id,omitempty"`
+	Name       string   `json:"name"`
+	MemberIDs  []string `json:"member_ids,omitempty"` // scope override
+	CreatedAt  int64    `json:"created_at"`
 }
 
 type CollaborationState struct {
 	Members     map[string]Member     `json:"members"`
 	Invitations map[string]Invitation `json:"invitations"`
+	Branches    map[string]Branch     `json:"branches"`
+	Folders     map[string]Folder     `json:"folders"`
 }
 
 // ─────────────────────────────────────────────
@@ -81,13 +109,15 @@ type CollaborationState struct {
 // ─────────────────────────────────────────────
 
 var (
-	dataDir  string
-	apiKeys  map[string]string
+	dataDir string
+	apiKeys map[string]string
 
-	mu             sync.RWMutex
-	collaboration  = CollaborationState{
+	mu            sync.RWMutex
+	collaboration = CollaborationState{
 		Members:     map[string]Member{},
 		Invitations: map[string]Invitation{},
+		Branches:    map[string]Branch{},
+		Folders:     map[string]Folder{},
 	}
 )
 
@@ -126,10 +156,20 @@ func main() {
 	mux.HandleFunc("/backup/pull/", auth(handleBackupPull))
 	mux.HandleFunc("/backup/list", auth(handleBackupList))
 
-	// Collaboration — cross-platform invitations and roles
+	// Collaboration — members
 	mux.HandleFunc("/members", auth(handleMembers))
+
+	// Collaboration — invitations
 	mux.HandleFunc("/invite", auth(handleCreateInvite))
 	mux.HandleFunc("/invite/", auth(handleInviteAction))
+
+	// Collaboration — family branches
+	mux.HandleFunc("/branches", auth(handleBranches))
+	mux.HandleFunc("/branches/", auth(handleBranchByID))
+
+	// Collaboration — folders within branches
+	mux.HandleFunc("/folders", auth(handleFolders))
+	mux.HandleFunc("/folders/", auth(handleFolderByID))
 
 	log.Printf("[letters2my-sync] listening on :%s …", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
@@ -203,10 +243,16 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
+	mu.RLock()
+	defer mu.RUnlock()
 	resp := StatusResponse{
 		Syncs:       listSyncs(),
 		Attachments: listAttachments(),
 		Recoveries:  listBackups(),
+		Branches:    len(collaboration.Branches),
+		Folders:     len(collaboration.Folders),
+		Members:     len(collaboration.Members),
+		Invitations: len(collaboration.Invitations),
 	}
 	writeJSON(w, resp)
 }
@@ -233,7 +279,7 @@ func handleSyncPush(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	n, _ := io.Copy(f, r.Body)
-	log.Printf("[sync] push %s → %d byte", platform, n)
+	log.Printf("[sync] push %s → %d bytes", platform, n)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -393,7 +439,7 @@ func listBackups() []RecoveryMeta {
 }
 
 // ─────────────────────────────────────────────
-// Collaboration — invitations and roles
+// Collaboration — members
 // ─────────────────────────────────────────────
 
 func handleMembers(w http.ResponseWriter, r *http.Request) {
@@ -447,6 +493,10 @@ func handleMembers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ─────────────────────────────────────────────
+// Collaboration — invitations
+// ─────────────────────────────────────────────
+
 func handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -454,8 +504,10 @@ func handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		CreatedBy string `json:"created_by"`
-		Role      string `json:"role"`
+		CreatedBy string   `json:"created_by"`
+		Role      string   `json:"role"`
+		BranchIDs []string `json:"branch_ids"`
+		FolderIDs []string `json:"folder_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
@@ -489,16 +541,20 @@ func handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 		Code:      code,
 		CreatedBy: req.CreatedBy,
 		Role:      inviteRole,
+		BranchIDs: req.BranchIDs,
+		FolderIDs: req.FolderIDs,
 		Expires:   time.Now().Add(7 * 24 * time.Hour).UnixMilli(),
 	}
 	collaboration.Invitations[code] = inv
 	saveCollaboration()
 
-	log.Printf("[invite] created %s for %s (role: %s)", code, req.CreatedBy, inviteRole)
+	log.Printf("[invite] created %s by %s (role: %s, branches: %v)", code, req.CreatedBy, inviteRole, req.BranchIDs)
 	writeJSON(w, map[string]any{
-		"code":    code,
-		"role":    inviteRole,
-		"expires": inv.Expires,
+		"code":       code,
+		"role":       inviteRole,
+		"branch_ids": req.BranchIDs,
+		"folder_ids": req.FolderIDs,
+		"expires":    inv.Expires,
 	})
 }
 
@@ -511,7 +567,6 @@ func handleInviteAction(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		// Look up an invitation (doesn't consume it)
 		mu.RLock()
 		defer mu.RUnlock()
 		inv, ok := collaboration.Invitations[code]
@@ -526,7 +581,6 @@ func handleInviteAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, inv)
 
 	case http.MethodPost:
-		// Accept an invitation
 		var req struct {
 			MemberID   string `json:"member_id"`
 			MemberName string `json:"member_name"`
@@ -549,23 +603,41 @@ func handleInviteAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		collaboration.Members[req.MemberID] = Member{
-			ID:    req.MemberID,
+		// Create the member
+		memberID := req.MemberID
+		member := Member{
+			ID:    memberID,
 			Name:  req.MemberName,
 			Role:  inv.Role,
 			Since: time.Now().UnixMilli(),
 		}
+		collaboration.Members[memberID] = member
+
+		// Grant access to the invited branches/folders
+		for _, branchID := range inv.BranchIDs {
+			if b, ok := collaboration.Branches[branchID]; ok {
+				b.MemberIDs = appendIfMissing(b.MemberIDs, memberID)
+				collaboration.Branches[branchID] = b
+			}
+		}
+		for _, folderID := range inv.FolderIDs {
+			if f, ok := collaboration.Folders[folderID]; ok {
+				f.MemberIDs = appendIfMissing(f.MemberIDs, memberID)
+				collaboration.Folders[folderID] = f
+			}
+		}
+
 		delete(collaboration.Invitations, code)
 		saveCollaboration()
 		log.Printf("[invite] accepted %s as %s (member: %s)", code, inv.Role, req.MemberName)
 		writeJSON(w, map[string]any{
-			"member_id": req.MemberID,
-			"role":      inv.Role,
-			"status":    "accepted",
+			"member_id":  memberID,
+			"role":       inv.Role,
+			"branch_ids": inv.BranchIDs,
+			"status":     "accepted",
 		})
 
 	case http.MethodDelete:
-		// Revoke an invitation
 		mu.Lock()
 		defer mu.Unlock()
 		_, ok := collaboration.Invitations[code]
@@ -580,6 +652,223 @@ func handleInviteAction(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		http.Error(w, "GET/POST/DELETE", http.StatusMethodNotAllowed)
+	}
+}
+
+// ─────────────────────────────────────────────
+// Collaboration — branches
+// ─────────────────────────────────────────────
+
+func handleBranches(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		mu.RLock()
+		defer mu.RUnlock()
+		branches := make([]Branch, 0, len(collaboration.Branches))
+		for _, b := range collaboration.Branches {
+			branches = append(branches, b)
+		}
+		writeJSON(w, branches)
+
+	case http.MethodPost:
+		var branch Branch
+		if err := json.NewDecoder(r.Body).Decode(&branch); err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		if branch.ID == "" || branch.Name == "" {
+			http.Error(w, "id and name required", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if branch.CreatedAt == 0 {
+			branch.CreatedAt = time.Now().UnixMilli()
+		}
+		if branch.Kind == "" {
+			branch.Kind = "custom"
+		}
+		collaboration.Branches[branch.ID] = branch
+		saveCollaboration()
+		log.Printf("[branches] created %s (%s)", branch.Name, branch.Kind)
+		writeJSON(w, branch)
+
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "id required", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		delete(collaboration.Branches, id)
+		// Cascade delete folders under this branch
+		for fid, f := range collaboration.Folders {
+			if f.BranchID == id {
+				delete(collaboration.Folders, fid)
+			}
+		}
+		saveCollaboration()
+		log.Printf("[branches] deleted %s", id)
+		w.WriteHeader(http.StatusOK)
+
+	default:
+		http.Error(w, "GET/POST/DELETE", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleBranchByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/branches/")
+	if id == "" || id == "/" {
+		http.Error(w, "branch id required", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		mu.RLock()
+		defer mu.RUnlock()
+		branch, ok := collaboration.Branches[id]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, branch)
+
+	case http.MethodPut:
+		// Update: share with members, rename, etc
+		var branch Branch
+		if err := json.NewDecoder(r.Body).Decode(&branch); err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := collaboration.Branches[id]; ok {
+			branch.ID = id
+			collaboration.Branches[id] = branch
+			saveCollaboration()
+			log.Printf("[branches] updated %s (shared with %d members)", id, len(branch.MemberIDs))
+		}
+		writeJSON(w, branch)
+
+	case http.MethodDelete:
+		mu.Lock()
+		defer mu.Unlock()
+		delete(collaboration.Branches, id)
+		for fid, f := range collaboration.Folders {
+			if f.BranchID == id {
+				delete(collaboration.Folders, fid)
+			}
+		}
+		saveCollaboration()
+		log.Printf("[branches] deleted %s", id)
+		w.WriteHeader(http.StatusOK)
+
+	default:
+		http.Error(w, "GET/PUT/DELETE", http.StatusMethodNotAllowed)
+	}
+}
+
+// ─────────────────────────────────────────────
+// Collaboration — folders
+// ─────────────────────────────────────────────
+
+func handleFolders(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		branchID := r.URL.Query().Get("branch_id")
+		mu.RLock()
+		defer mu.RUnlock()
+		folders := make([]Folder, 0)
+		for _, f := range collaboration.Folders {
+			if branchID == "" || f.BranchID == branchID {
+				folders = append(folders, f)
+			}
+		}
+		writeJSON(w, folders)
+
+	case http.MethodPost:
+		var folder Folder
+		if err := json.NewDecoder(r.Body).Decode(&folder); err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		if folder.ID == "" || folder.Name == "" || folder.BranchID == "" {
+			http.Error(w, "id, name, and branch_id required", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if folder.CreatedAt == 0 {
+			folder.CreatedAt = time.Now().UnixMilli()
+		}
+		collaboration.Folders[folder.ID] = folder
+		saveCollaboration()
+		log.Printf("[folders] created %s in branch %s", folder.Name, folder.BranchID)
+		writeJSON(w, folder)
+
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "id required", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		delete(collaboration.Folders, id)
+		saveCollaboration()
+		log.Printf("[folders] deleted %s", id)
+		w.WriteHeader(http.StatusOK)
+
+	default:
+		http.Error(w, "GET/POST/DELETE", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleFolderByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/folders/")
+	if id == "" || id == "/" {
+		http.Error(w, "folder id required", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		mu.RLock()
+		defer mu.RUnlock()
+		folder, ok := collaboration.Folders[id]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, folder)
+
+	case http.MethodPut:
+		var folder Folder
+		if err := json.NewDecoder(r.Body).Decode(&folder); err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := collaboration.Folders[id]; ok {
+			folder.ID = id
+			collaboration.Folders[id] = folder
+			saveCollaboration()
+		}
+		writeJSON(w, folder)
+
+	case http.MethodDelete:
+		mu.Lock()
+		defer mu.Unlock()
+		delete(collaboration.Folders, id)
+		saveCollaboration()
+		log.Printf("[folders] deleted %s", id)
+		w.WriteHeader(http.StatusOK)
+
+	default:
+		http.Error(w, "GET/PUT/DELETE", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -601,4 +890,13 @@ func writeJSON(w http.ResponseWriter, v any) {
 func sha256hex(data []byte) string {
 	h := sha256.Sum256(data)
 	return fmt.Sprintf("%x", h)
+}
+
+func appendIfMissing(slice []string, item string) []string {
+	for _, s := range slice {
+		if s == item {
+			return slice
+		}
+	}
+	return append(slice, item)
 }

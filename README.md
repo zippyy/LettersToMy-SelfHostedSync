@@ -82,6 +82,27 @@ one person creates an invite, the other accepts it on any platform.
 
 **Roles**: `owner`, `editor`, `contributor`, `viewer`
 
+### Family structure — branches and folders
+
+Manage family sides (Parents, Maternal, Paternal, etc) and archive
+folders. Access is scoped by member — each branch and folder lists
+which member IDs can access it.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/branches` | List all family branches |
+| `POST` | `/branches` | Create a new branch |
+| `GET` | `/branches/:id` | Get a specific branch with members |
+| `PUT` | `/branches/:id` | Update branch (rename, share with members) |
+| `DELETE` | `/branches/:id` | Delete branch (cascades to folders) |
+| `GET` | `/folders?branch_id=X` | List folders (optionally filtered by branch) |
+| `POST` | `/folders` | Create a folder in a branch |
+| `GET` | `/folders/:id` | Get a specific folder |
+| `PUT` | `/folders/:id` | Update folder (rename, share with members) |
+| `DELETE` | `/folders/:id` | Delete folder |
+
+Branch kinds: `parents`, `maternal`, `paternal`, `chosenFamily`, `custom`
+
 ### Status
 
 | Method | Path | Description |
