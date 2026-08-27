@@ -1,0 +1,8 @@
+# Compiled binaries
+/LettersToMy-SelfHostedSync
+/letters2my-sync
+*.exe
+
+# Local state
+/data/
+*.db
