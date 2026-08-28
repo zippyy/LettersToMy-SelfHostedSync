@@ -3,644 +3,665 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-// testEnv points the server at a temp data dir with a known token and
-// returns a fresh mux. The global state is scoped per test to keep
-// tests independent.
-func testEnv(t *testing.T) (*http.ServeMux, string) {
+const testToken = "test-secret-token"
+
+func testServer(t *testing.T) *Server {
 	t.Helper()
-	dir := t.TempDir()
-	dataDir = dir
-
-	// Isolate global state between tests.
-	mu.Lock()
-	collaboration = CollaborationState{
-		Members:     map[string]Member{},
-		Invitations: map[string]Invitation{},
-		Branches:    map[string]Branch{},
-		Folders:     map[string]Folder{},
-	}
-	mu.Unlock()
-
-	// main() creates these; tests call newMux() directly, so mirror it.
-	os.MkdirAll(filepath.Join(dataDir, "sync"), 0755)
-	os.MkdirAll(filepath.Join(dataDir, "attachments"), 0755)
-	os.MkdirAll(filepath.Join(dataDir, "backup"), 0755)
-
-	apiKeys = map[string]string{"test": sha256hex([]byte("secret-token"))}
-
-	return newMux(), "secret-token"
-}
-
-// do performs an authenticated request and returns the response.
-func do(t *testing.T, mux *http.ServeMux, method, path, token string, body io.Reader) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(method, path, body)
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-	return rec
-}
-
-func decodeBody(t *testing.T, rec *httptest.ResponseRecorder, v any) {
-	t.Helper()
-	if err := json.Unmarshal(rec.Body.Bytes(), v); err != nil {
-		t.Fatalf("decode %s: %v (body %q)", rec.Result().Request.URL.Path, err, rec.Body.String())
-	}
-}
-
-func TestStatusIdentityAndCapabilities(t *testing.T) {
-	mux, token := testEnv(t)
-	rec := do(t, mux, http.MethodGet, "/status", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var s StatusResponse
-	decodeBody(t, rec, &s)
-	if s.Service != serviceName {
-		t.Errorf("service = %q, want %q", s.Service, serviceName)
-	}
-	if s.APIVersion != apiVersion {
-		t.Errorf("api_version = %d, want %d", s.APIVersion, apiVersion)
-	}
-	if s.ServerVersion != serverVersion {
-		t.Errorf("server_version = %q, want %q", s.ServerVersion, serverVersion)
-	}
-	found := map[string]bool{}
-	for _, c := range s.Capabilities {
-		found[c] = true
-	}
-	for _, want := range []string{"collaboration", "backups", "attachments"} {
-		if !found[want] {
-			t.Errorf("capability %q missing from %v", want, s.Capabilities)
-		}
-	}
-	// Collections must be arrays, never null.
-	if s.Syncs == nil || s.Attachments == nil || s.Recoveries == nil {
-		t.Errorf("status collections must be [] not null: %+v", s)
-	}
-}
-
-func TestAuth(t *testing.T) {
-	mux, token := testEnv(t)
-
-	rec := do(t, mux, http.MethodGet, "/status", "", nil)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("missing token = %d, want 401", rec.Code)
-	}
-	assertErrorCode(t, rec, "unauthorized")
-
-	rec = do(t, mux, http.MethodGet, "/status", "wrong-token", nil)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("wrong token = %d, want 401", rec.Code)
-	}
-
-	rec = do(t, mux, http.MethodGet, "/status", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("correct token = %d, want 200", rec.Code)
-	}
-}
-
-func assertErrorCode(t *testing.T, rec *httptest.ResponseRecorder, wantCode string) {
-	t.Helper()
-	var body errorBody
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("error body is not JSON: %v (body %q)", err, rec.Body.String())
-	}
-	if body.Error.Code != wantCode {
-		t.Errorf("error.code = %q, want %q (body %q)", body.Error.Code, wantCode, rec.Body.String())
-	}
-	if body.Error.Message == "" {
-		t.Errorf("error.message is empty")
-	}
-}
-
-func TestInvitationLifecycle(t *testing.T) {
-	mux, token := testEnv(t)
-
-	// Create invitation
-	create := `{"created_by":"owner-1","role":"organizer","branch_ids":["b1"],"folder_ids":[]}`
-	rec := do(t, mux, http.MethodPost, "/invite", token, strings.NewReader(create))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("create invite = %d, want 200 (body %q)", rec.Code, rec.Body.String())
-	}
-	var inv Invitation
-	decodeBody(t, rec, &inv)
-	if inv.Code == "" {
-		t.Fatal("invite code is empty")
-	}
-	if inv.Role != RoleOrganizer {
-		t.Errorf("role = %q, want organizer", inv.Role)
-	}
-	if inv.CreatedBy != "owner-1" {
-		t.Errorf("created_by = %q, want owner-1", inv.CreatedBy)
-	}
-	if inv.BranchIDs == nil || inv.FolderIDs == nil {
-		t.Errorf("branch_ids/folder_ids must be [] not null: %+v", inv)
-	}
-
-	// Lookup
-	rec = do(t, mux, http.MethodGet, "/invite/"+inv.Code, token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("lookup invite = %d, want 200", rec.Code)
-	}
-	var got Invitation
-	decodeBody(t, rec, &got)
-	if got.Code != inv.Code || got.Role != inv.Role {
-		t.Errorf("lookup mismatch: %+v vs %+v", got, inv)
-	}
-
-	// Accept as a new member
-	accept := `{"member_id":"acceptor-1","member_name":"Aunt June"}`
-	rec = do(t, mux, http.MethodPost, "/invite/"+inv.Code, token, strings.NewReader(accept))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("accept invite = %d, want 200 (body %q)", rec.Code, rec.Body.String())
-	}
-	var acceptResp map[string]any
-	decodeBody(t, rec, &acceptResp)
-	if acceptResp["status"] != "accepted" {
-		t.Errorf("accept status = %v, want accepted", acceptResp["status"])
-	}
-	if acceptResp["role"] != "organizer" {
-		t.Errorf("accept role = %v, want organizer", acceptResp["role"])
-	}
-
-	// Invitation must no longer be pending.
-	rec = do(t, mux, http.MethodGet, "/invite/"+inv.Code, token, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("accepted invite lookup = %d, want 404", rec.Code)
-	}
-
-	// Member created with the invited role.
-	rec = do(t, mux, http.MethodGet, "/members", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("list members = %d", rec.Code)
-	}
-	var members []Member
-	decodeBody(t, rec, &members)
-	found := false
-	for _, m := range members {
-		if m.ID == "acceptor-1" {
-			found = true
-			if m.Role != RoleOrganizer {
-				t.Errorf("member role = %q, want organizer", m.Role)
-			}
-			if m.Since == 0 {
-				t.Errorf("member since unset")
-			}
-		}
-	}
-	if !found {
-		t.Errorf("accepted member not in member list: %+v", members)
-	}
-}
-
-func TestInviteRejectsDuplicateMember(t *testing.T) {
-	mux, token := testEnv(t)
-	do(t, mux, http.MethodPost, "/invite", token, strings.NewReader(`{"created_by":"o","role":"viewer"}`))
-	// Create a member first.
-	do(t, mux, http.MethodPut, "/members", token, strings.NewReader(`{"id":"m1","name":"M","role":"viewer"}`))
-	// Create a second invite and try to accept with the same member id.
-	rec := do(t, mux, http.MethodPost, "/invite", token, strings.NewReader(`{"created_by":"o","role":"viewer"}`))
-	var inv Invitation
-	decodeBody(t, rec, &inv)
-	rec = do(t, mux, http.MethodPost, "/invite/"+inv.Code, token, strings.NewReader(`{"member_id":"m1","member_name":"M"}`))
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("duplicate accept = %d, want 409", rec.Code)
-	}
-	assertErrorCode(t, rec, "conflict")
-}
-
-func TestInviteExpiration(t *testing.T) {
-	mux, token := testEnv(t)
-	// Insert an already-expired invitation directly.
-	mu.Lock()
-	collaboration.Invitations["EXPIRED1"] = Invitation{
-		Code: "EXPIRED1", CreatedBy: "o", Role: RoleViewer,
-		Expires: time.Now().Add(-time.Hour).UnixMilli(),
-	}
-	mu.Unlock()
-
-	rec := do(t, mux, http.MethodGet, "/invite/EXPIRED1", token, nil)
-	if rec.Code != http.StatusGone {
-		t.Fatalf("expired lookup = %d, want 410", rec.Code)
-	}
-	assertErrorCode(t, rec, "expired")
-
-	rec = do(t, mux, http.MethodPost, "/invite/EXPIRED1", token, strings.NewReader(`{"member_id":"m","member_name":"M"}`))
-	if rec.Code != http.StatusGone {
-		t.Fatalf("expired accept = %d, want 410", rec.Code)
-	}
-}
-
-func TestInviteRevoke(t *testing.T) {
-	mux, token := testEnv(t)
-	rec := do(t, mux, http.MethodPost, "/invite", token, strings.NewReader(`{"created_by":"o","role":"viewer"}`))
-	var inv Invitation
-	decodeBody(t, rec, &inv)
-
-	rec = do(t, mux, http.MethodDelete, "/invite/"+inv.Code, token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("revoke = %d, want 200", rec.Code)
-	}
-	rec = do(t, mux, http.MethodGet, "/invite/"+inv.Code, token, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("revoked lookup = %d, want 404", rec.Code)
-	}
-}
-
-func TestInviteRejectsUnknownRole(t *testing.T) {
-	mux, token := testEnv(t)
-	rec := do(t, mux, http.MethodPost, "/invite", token, strings.NewReader(`{"created_by":"o","role":"superuser","branch_ids":[]}`))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("unknown role = %d, want 400 (body %q)", rec.Code, rec.Body.String())
-	}
-	assertErrorCode(t, rec, "invalid_request")
-}
-
-func TestInviteRoleDefaultsToViewer(t *testing.T) {
-	mux, token := testEnv(t)
-	rec := do(t, mux, http.MethodPost, "/invite", token, strings.NewReader(`{"created_by":"o"}`))
-	var inv Invitation
-	decodeBody(t, rec, &inv)
-	if inv.Role != RoleViewer {
-		t.Errorf("default role = %q, want viewer (least privilege)", inv.Role)
-	}
-}
-
-func TestMemberRoleValidation(t *testing.T) {
-	mux, token := testEnv(t)
-	rec := do(t, mux, http.MethodPut, "/members", token, strings.NewReader(`{"id":"m1","name":"M","role":"admin"}`))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("unknown member role = %d, want 400", rec.Code)
-	}
-	assertErrorCode(t, rec, "invalid_request")
-}
-
-func TestMemberRemoveCleansScope(t *testing.T) {
-	mux, token := testEnv(t)
-	// Member
-	do(t, mux, http.MethodPut, "/members", token, strings.NewReader(`{"id":"m1","name":"M","role":"viewer"}`))
-	// Branch shared with m1
-	do(t, mux, http.MethodPost, "/branches", token, strings.NewReader(`{"id":"b1","name":"Side","kind":"paternal","member_ids":["m1"]}`))
-	// Folder shared with m1
-	do(t, mux, http.MethodPost, "/folders", token, strings.NewReader(`{"id":"f1","branch_id":"b1","name":"Box","member_ids":["m1"]}`))
-
-	rec := do(t, mux, http.MethodDelete, "/members?id=m1", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("remove member = %d, want 200", rec.Code)
-	}
-
-	rec = do(t, mux, http.MethodGet, "/branches/b1", token, nil)
-	var b Branch
-	decodeBody(t, rec, &b)
-	if len(b.MemberIDs) != 0 {
-		t.Errorf("branch scope not cleaned: %v", b.MemberIDs)
-	}
-	rec = do(t, mux, http.MethodGet, "/folders/f1", token, nil)
-	var f Folder
-	decodeBody(t, rec, &f)
-	if len(f.MemberIDs) != 0 {
-		t.Errorf("folder scope not cleaned: %v", f.MemberIDs)
-	}
-
-	// Deleting a missing member is 404, not a silent success.
-	rec = do(t, mux, http.MethodDelete, "/members?id=nope", token, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("delete missing member = %d, want 404", rec.Code)
-	}
-}
-
-func TestBranchLifecycle(t *testing.T) {
-	mux, token := testEnv(t)
-
-	// Create
-	rec := do(t, mux, http.MethodPost, "/branches", token, strings.NewReader(`{"id":"b1","name":"Maternal","kind":"maternal"}`))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("create branch = %d (body %q)", rec.Code, rec.Body.String())
-	}
-	var b Branch
-	decodeBody(t, rec, &b)
-	if b.IsSeeded || b.CreatedAt == 0 || b.MemberIDs == nil || len(b.MemberIDs) != 0 {
-		t.Errorf("branch defaults wrong: %+v", b)
-	}
-
-	// Duplicate create → 409
-	rec = do(t, mux, http.MethodPost, "/branches", token, strings.NewReader(`{"id":"b1","name":"Maternal"}`))
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("duplicate branch = %d, want 409", rec.Code)
-	}
-
-	// List
-	rec = do(t, mux, http.MethodGet, "/branches", token, nil)
-	var branches []Branch
-	decodeBody(t, rec, &branches)
-	if len(branches) != 1 {
-		t.Fatalf("branch list len = %d, want 1", len(branches))
-	}
-
-	// Get
-	rec = do(t, mux, http.MethodGet, "/branches/b1", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("get branch = %d", rec.Code)
-	}
-
-	// Update
-	rec = do(t, mux, http.MethodPut, "/branches/b1", token, strings.NewReader(`{"name":"Maternal side","kind":"maternal","member_ids":["m1"]}`))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("update branch = %d (body %q)", rec.Code, rec.Body.String())
-	}
-	decodeBody(t, rec, &b)
-	if b.Name != "Maternal side" || len(b.MemberIDs) != 1 || b.ID != "b1" {
-		t.Errorf("update result wrong: %+v", b)
-	}
-
-	// Update missing branch → 404 (no false success)
-	rec = do(t, mux, http.MethodPut, "/branches/missing", token, strings.NewReader(`{"name":"x"}`))
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("update missing branch = %d, want 404", rec.Code)
-	}
-	assertErrorCode(t, rec, "not_found")
-
-	// Delete cascades folders
-	do(t, mux, http.MethodPost, "/folders", token, strings.NewReader(`{"id":"f1","branch_id":"b1","name":"Box"}`))
-	rec = do(t, mux, http.MethodDelete, "/branches/b1", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("delete branch = %d", rec.Code)
-	}
-	rec = do(t, mux, http.MethodGet, "/folders/f1", token, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("folder after branch delete = %d, want 404 (cascade)", rec.Code)
-	}
-}
-
-func TestFolderLifecycle(t *testing.T) {
-	mux, token := testEnv(t)
-	do(t, mux, http.MethodPost, "/branches", token, strings.NewReader(`{"id":"b1","name":"Paternal"}`))
-
-	// Create
-	rec := do(t, mux, http.MethodPost, "/folders", token, strings.NewReader(`{"id":"f1","branch_id":"b1","name":"Grandpa letters"}`))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("create folder = %d (body %q)", rec.Code, rec.Body.String())
-	}
-	var f Folder
-	decodeBody(t, rec, &f)
-	if f.MemberIDs == nil {
-		t.Errorf("member_ids must be [] not null: %+v", f)
-	}
-
-	// Folder in missing branch → 422
-	rec = do(t, mux, http.MethodPost, "/folders", token, strings.NewReader(`{"id":"f2","branch_id":"nope","name":"X"}`))
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("folder in missing branch = %d, want 422", rec.Code)
-	}
-
-	// Filter by branch
-	do(t, mux, http.MethodPost, "/folders", token, strings.NewReader(`{"id":"f3","branch_id":"b1","name":"Another","parent_id":"f1"}`))
-	rec = do(t, mux, http.MethodGet, "/folders?branch_id=b1", token, nil)
-	var folders []Folder
-	decodeBody(t, rec, &folders)
-	if len(folders) != 2 {
-		t.Fatalf("filtered folder len = %d, want 2", len(folders))
-	}
-
-	// Update
-	rec = do(t, mux, http.MethodPut, "/folders/f1", token, strings.NewReader(`{"branch_id":"b1","name":"Renamed"}`))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("update folder = %d", rec.Code)
-	}
-	decodeBody(t, rec, &f)
-	if f.Name != "Renamed" || f.ID != "f1" {
-		t.Errorf("update result wrong: %+v", f)
-	}
-
-	// Update missing → 404
-	rec = do(t, mux, http.MethodPut, "/folders/missing", token, strings.NewReader(`{"branch_id":"b1","name":"x"}`))
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("update missing folder = %d, want 404", rec.Code)
-	}
-
-	// Delete
-	rec = do(t, mux, http.MethodDelete, "/folders/f1", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("delete folder = %d", rec.Code)
-	}
-	rec = do(t, mux, http.MethodGet, "/folders/f1", token, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("deleted folder = %d, want 404", rec.Code)
-	}
-}
-
-func TestBackupRoundTrip(t *testing.T) {
-	mux, token := testEnv(t)
-	payload := bytes.Repeat([]byte("encrypted-blob-"), 100)
-
-	// Push
-	rec := do(t, mux, http.MethodPut, "/backup/push?id=backup-1", token, bytes.NewReader(payload))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("backup push = %d (body %q)", rec.Code, rec.Body.String())
-	}
-	var meta RecoveryMeta
-	decodeBody(t, rec, &meta)
-	if meta.ID != "backup-1" || meta.Size != int64(len(payload)) || meta.Timestamp == 0 {
-		t.Errorf("push meta wrong: %+v", meta)
-	}
-
-	// List
-	rec = do(t, mux, http.MethodGet, "/backup/list", token, nil)
-	var backups []RecoveryMeta
-	decodeBody(t, rec, &backups)
-	if len(backups) != 1 || backups[0].ID != "backup-1" {
-		t.Fatalf("backup list wrong: %+v", backups)
-	}
-
-	// Pull — byte-identical
-	rec = do(t, mux, http.MethodGet, "/backup/pull/backup-1", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("backup pull = %d", rec.Code)
-	}
-	if !bytes.Equal(rec.Body.Bytes(), payload) {
-		t.Fatal("backup bytes do not match after round trip")
-	}
-
-	// Missing pull → 404
-	rec = do(t, mux, http.MethodGet, "/backup/pull/missing", token, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("missing backup = %d, want 404", rec.Code)
-	}
-
-	// Delete
-	rec = do(t, mux, http.MethodDelete, "/backup/backup-1", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("backup delete = %d", rec.Code)
-	}
-	rec = do(t, mux, http.MethodGet, "/backup/list", token, nil)
-	decodeBody(t, rec, &backups)
-	if len(backups) != 0 {
-		t.Errorf("backup list after delete = %d, want 0", len(backups))
-	}
-}
-
-func TestAttachmentRoundTrip(t *testing.T) {
-	mux, token := testEnv(t)
-	payload := bytes.Repeat([]byte{0xAB, 0xCD}, 500)
-
-	rec := do(t, mux, http.MethodPut, "/attachment/upload?id=att-1", token, bytes.NewReader(payload))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("attachment upload = %d (body %q)", rec.Code, rec.Body.String())
-	}
-
-	rec = do(t, mux, http.MethodGet, "/attachment/list", token, nil)
-	var atts []AttachmentMeta
-	decodeBody(t, rec, &atts)
-	if len(atts) != 1 || atts[0].ID != "att-1" {
-		t.Fatalf("attachment list wrong: %+v", atts)
-	}
-
-	rec = do(t, mux, http.MethodGet, "/attachment/download/att-1", token, nil)
-	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), payload) {
-		t.Fatalf("attachment download mismatch (code %d)", rec.Code)
-	}
-
-	rec = do(t, mux, http.MethodDelete, "/attachment/att-1", token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("attachment delete = %d", rec.Code)
-	}
-	rec = do(t, mux, http.MethodGet, "/attachment/download/att-1", token, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("deleted attachment = %d, want 404", rec.Code)
-	}
-}
-
-func TestIDValidationBlocksTraversal(t *testing.T) {
-	mux, token := testEnv(t)
-	for _, bad := range []string{
-		"../../etc/passwd",
-		"..%2F..%2Fetc",
-		"a/b",
-		"",
-		"a b",
-		"backup;rm",
-	} {
-		target := "/backup/push?id=" + url.QueryEscape(bad)
-		rec := do(t, mux, http.MethodPut, target, token, strings.NewReader("x"))
-		if rec.Code != http.StatusBadRequest {
-			t.Errorf("backup id %q = %d, want 400", bad, rec.Code)
-		}
-	}
-	// Same for attachment upload ids.
-	rec := do(t, mux, http.MethodPut, "/attachment/upload?id="+url.QueryEscape("../x"), token, strings.NewReader("x"))
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("attachment traversal id = %d, want 400", rec.Code)
-	}
-	// Valid UUIDs and invite codes pass validation (404 because missing).
-	rec = do(t, mux, http.MethodGet, "/branches/7B8E0A2C-3D4F-5A6B-7C8D-9E0F1A2B3C4D", token, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("uuid branch = %d, want 404 (validated, then missing)", rec.Code)
-	}
-}
-
-func TestSyncSnapshotStorage(t *testing.T) {
-	mux, token := testEnv(t)
-	blob := []byte("not-a-real-database")
-
-	rec := do(t, mux, http.MethodPut, "/sync/push/ios", token, bytes.NewReader(blob))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("sync push = %d", rec.Code)
-	}
-
-	rec = do(t, mux, http.MethodGet, "/sync/list", token, nil)
-	var syncs []SyncPayload
-	decodeBody(t, rec, &syncs)
-	if len(syncs) != 1 || syncs[0].Platform != "ios" || syncs[0].Kind != "device-snapshot" {
-		t.Fatalf("sync list wrong: %+v", syncs)
-	}
-
-	rec = do(t, mux, http.MethodGet, "/sync/pull/ios", token, nil)
-	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), blob) {
-		t.Fatalf("sync pull mismatch (code %d)", rec.Code)
-	}
-
-	rec = do(t, mux, http.MethodGet, "/sync/pull/android", token, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("missing platform = %d, want 404", rec.Code)
-	}
-}
-
-func TestMethodNotAllowed(t *testing.T) {
-	mux, token := testEnv(t)
-	rec := do(t, mux, http.MethodDelete, "/status", token, nil)
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("DELETE /status = %d, want 405", rec.Code)
-	}
-	assertErrorCode(t, rec, "method_not_allowed")
-}
-
-func TestPersistenceAcrossRestart(t *testing.T) {
-	// Simulates container restart: save collaboration state to disk,
-	// then reload it into a fresh CollaborationState.
-	dir := t.TempDir()
-	dataDir = dir
-	defer func() { dataDir = "" }()
-
-	mu.Lock()
-	collaboration = CollaborationState{
-		Members:     map[string]Member{},
-		Invitations: map[string]Invitation{},
-		Branches:    map[string]Branch{},
-		Folders:     map[string]Folder{},
-	}
-	collaboration.Branches["b1"] = Branch{ID: "b1", Name: "Maternal", Kind: "maternal", MemberIDs: []string{}, CreatedAt: time.Now().UnixMilli()}
-	collaboration.Members["m1"] = Member{ID: "m1", Name: "M", Role: RoleViewer, Since: time.Now().UnixMilli()}
-	saveCollaboration()
-	mu.Unlock()
-
-	// Reload into a clean state.
-	mu.Lock()
-	collaboration = CollaborationState{
-		Members:     map[string]Member{},
-		Invitations: map[string]Invitation{},
-		Branches:    map[string]Branch{},
-		Folders:     map[string]Folder{},
-	}
-	mu.Unlock()
-	loadCollaboration()
-
-	mu.RLock()
-	defer mu.RUnlock()
-	if len(collaboration.Branches) != 1 || collaboration.Branches["b1"].Name != "Maternal" {
-		t.Errorf("branch not restored after restart: %+v", collaboration.Branches)
-	}
-	if len(collaboration.Members) != 1 || collaboration.Members["m1"].Role != RoleViewer {
-		t.Errorf("member not restored after restart: %+v", collaboration.Members)
-	}
-	// The data file on disk is a valid JSON document.
-	data, err := os.ReadFile(filepath.Join(dir, "collaboration.json"))
+	server, err := newServer(
+		t.TempDir(),
+		map[string]string{"test": sha256hex([]byte(testToken))},
+		Limits{JSONBody: 256, Sync: 32, Attachment: 32, Backup: 32},
+		"test",
+	)
 	if err != nil {
-		t.Fatalf("collaboration.json missing: %v", err)
+		t.Fatal(err)
 	}
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("collaboration.json invalid JSON: %v", err)
+	fixedNow := time.UnixMilli(1_700_000_000_000)
+	server.now = func() time.Time { return fixedNow }
+	return server
+}
+
+func request(server *Server, method, path string, body io.Reader) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, body)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	return recorder
+}
+
+func requestWithBody(server *Server, method, path string, body io.ReadCloser) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, body)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	return recorder
+}
+
+func jsonRequest(t *testing.T, server *Server, method, path string, value any) *httptest.ResponseRecorder {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(method, path, bytes.NewReader(data))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	return recorder
+}
+
+func decodeResponse[T any](t *testing.T, recorder *httptest.ResponseRecorder) T {
+	t.Helper()
+	var value T
+	if err := json.Unmarshal(recorder.Body.Bytes(), &value); err != nil {
+		t.Fatalf("decode response %s: %v; body=%q", recorder.Result().Status, err, recorder.Body.String())
+	}
+	return value
+}
+
+func requireStatus(t *testing.T, recorder *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	if recorder.Code != want {
+		t.Fatalf("status=%d want=%d body=%s", recorder.Code, want, recorder.Body.String())
 	}
 }
 
-func TestMain(m *testing.M) {
-	code := m.Run()
-	os.Exit(code)
+func putMember(t *testing.T, server *Server, id string, role Role) {
+	t.Helper()
+	recorder := jsonRequest(t, server, http.MethodPut, "/members", Member{ID: id, Name: id + " name", Role: role})
+	requireStatus(t, recorder, http.StatusOK)
 }
 
-var _ = fmt.Sprintf // keep fmt import if unused in some build modes
+func putBranch(t *testing.T, server *Server, branch Branch) *httptest.ResponseRecorder {
+	t.Helper()
+	return jsonRequest(t, server, http.MethodPost, "/branches", branch)
+}
+
+func putFolder(t *testing.T, server *Server, folder Folder) *httptest.ResponseRecorder {
+	t.Helper()
+	return jsonRequest(t, server, http.MethodPost, "/folders", folder)
+}
+
+func createInvite(t *testing.T, server *Server, createdBy string, role Role, branches, folders []string) Invitation {
+	t.Helper()
+	recorder := jsonRequest(t, server, http.MethodPost, "/invite", map[string]any{
+		"created_by": createdBy,
+		"role":       role,
+		"branch_ids": branches,
+		"folder_ids": folders,
+	})
+	requireStatus(t, recorder, http.StatusCreated)
+	return decodeResponse[Invitation](t, recorder)
+}
+
+func TestAuthenticationAndMethods(t *testing.T) {
+	server := testServer(t)
+	for name, authorization := range map[string]string{
+		"missing":   "",
+		"wrong":     "Bearer wrong",
+		"malformed": "Token " + testToken,
+		"extra":     "Bearer " + testToken + " extra",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/status", nil)
+			if authorization != "" {
+				req.Header.Set("Authorization", authorization)
+			}
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, req)
+			requireStatus(t, recorder, http.StatusUnauthorized)
+			if recorder.Header().Get("WWW-Authenticate") != "Bearer" {
+				t.Fatalf("missing bearer challenge")
+			}
+		})
+	}
+
+	status := request(server, http.MethodGet, "/status", nil)
+	requireStatus(t, status, http.StatusOK)
+	decoded := decodeResponse[StatusResponse](t, status)
+	if decoded.Syncs == nil || decoded.Attachments == nil || decoded.Recoveries == nil {
+		t.Fatalf("fresh status must use empty arrays, got %+v", decoded)
+	}
+
+	wrongMethod := request(server, http.MethodPost, "/sync/list", nil)
+	requireStatus(t, wrongMethod, http.StatusMethodNotAllowed)
+	if wrongMethod.Header().Get("Allow") != http.MethodGet {
+		t.Fatalf("Allow=%q", wrongMethod.Header().Get("Allow"))
+	}
+	wrongMethod = request(server, http.MethodPost, "/status", nil)
+	requireStatus(t, wrongMethod, http.StatusMethodNotAllowed)
+}
+
+func TestSyncAttachmentAndBackupRoundTrips(t *testing.T) {
+	server := testServer(t)
+	for _, test := range []struct {
+		name     string
+		pushPath string
+		pullPath string
+		listPath string
+		first    string
+		second   string
+		missing  string
+		bad      string
+		tooLarge string
+	}{
+		{name: "sync", pushPath: "/sync/push/ios", pullPath: "/sync/pull/ios", listPath: "/sync/list", first: "sync-one", second: "sync-two", missing: "/sync/pull/android", bad: "/sync/push/windows", tooLarge: "1234567890123456789012345678901234567890"},
+		{name: "attachment", pushPath: "/attachment/upload?id=photo-1", pullPath: "/attachment/download/photo-1", listPath: "/status", first: "photo-one", second: "photo-two", missing: "/attachment/download/missing", bad: "/attachment/upload?id=../escape", tooLarge: "1234567890123456789012345678901234567890"},
+		{name: "backup", pushPath: "/backup/push?id=archive-1", pullPath: "/backup/pull/archive-1", listPath: "/backup/list", first: "backup-one", second: "backup-two", missing: "/backup/pull/missing", bad: "/backup/push?id=../escape", tooLarge: "1234567890123456789012345678901234567890"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			first := request(server, http.MethodPut, test.pushPath, strings.NewReader(test.first))
+			requireStatus(t, first, http.StatusOK)
+			second := request(server, http.MethodPut, test.pushPath, strings.NewReader(test.second))
+			requireStatus(t, second, http.StatusOK)
+
+			pulled := request(server, http.MethodGet, test.pullPath, nil)
+			requireStatus(t, pulled, http.StatusOK)
+			if pulled.Body.String() != test.second {
+				t.Fatalf("round trip=%q want=%q", pulled.Body.String(), test.second)
+			}
+			missing := request(server, http.MethodGet, test.missing, nil)
+			requireStatus(t, missing, http.StatusNotFound)
+			bad := request(server, http.MethodPut, test.bad, strings.NewReader("bad"))
+			requireStatus(t, bad, http.StatusBadRequest)
+			tooLarge := request(server, http.MethodPut, test.pushPath, strings.NewReader(test.tooLarge))
+			requireStatus(t, tooLarge, http.StatusRequestEntityTooLarge)
+			stillGood := request(server, http.MethodGet, test.pullPath, nil)
+			requireStatus(t, stillGood, http.StatusOK)
+			if stillGood.Body.String() != test.second {
+				t.Fatalf("oversized upload destroyed good data: %q", stillGood.Body.String())
+			}
+
+			if test.name == "backup" {
+				generatedOne := request(server, http.MethodPut, "/backup/push", strings.NewReader("a"))
+				generatedTwo := request(server, http.MethodPut, "/backup/push", strings.NewReader("b"))
+				requireStatus(t, generatedOne, http.StatusOK)
+				requireStatus(t, generatedTwo, http.StatusOK)
+				one := decodeResponse[uploadResult](t, generatedOne)
+				two := decodeResponse[uploadResult](t, generatedTwo)
+				if one.ID == two.ID || !validIdentifier(one.ID) || !validIdentifier(two.ID) {
+					t.Fatalf("generated IDs collided or were invalid: %q %q", one.ID, two.ID)
+				}
+				list := request(server, http.MethodGet, test.listPath, nil)
+				requireStatus(t, list, http.StatusOK)
+				backups := decodeResponse[[]RecoveryMeta](t, list)
+				if len(backups) != 3 {
+					t.Fatalf("backups=%+v", backups)
+				}
+			}
+		})
+	}
+}
+
+type failingBody struct {
+	data []byte
+	done bool
+}
+
+func (body *failingBody) Read(buffer []byte) (int, error) {
+	if body.done {
+		return 0, errors.New("simulated upload interruption")
+	}
+	body.done = true
+	n := copy(buffer, body.data)
+	return n, errors.New("simulated upload interruption")
+}
+
+func (body *failingBody) Close() error { return nil }
+
+func TestInterruptedUploadPreservesPreviousSnapshot(t *testing.T) {
+	server := testServer(t)
+	requireStatus(t, request(server, http.MethodPut, "/sync/push/ios", strings.NewReader("good")), http.StatusOK)
+	interrupted := requestWithBody(server, http.MethodPut, "/sync/push/ios", &failingBody{data: []byte("partial")})
+	requireStatus(t, interrupted, http.StatusInternalServerError)
+	pulled := request(server, http.MethodGet, "/sync/pull/ios", nil)
+	requireStatus(t, pulled, http.StatusOK)
+	if pulled.Body.String() != "good" {
+		t.Fatalf("interrupted upload changed snapshot to %q", pulled.Body.String())
+	}
+}
+
+func TestConcurrentSnapshotUploadsDoNotInterleave(t *testing.T) {
+	server := testServer(t)
+	server.limits.Sync = 1024
+	payloads := make([]string, 20)
+	for index := range payloads {
+		payloads[index] = strings.Repeat(string(rune('a'+index)), 100)
+	}
+	var group sync.WaitGroup
+	statuses := make(chan int, len(payloads))
+	for _, payload := range payloads {
+		payload := payload
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			statuses <- request(server, http.MethodPut, "/sync/push/ios", strings.NewReader(payload)).Code
+		}()
+	}
+	group.Wait()
+	close(statuses)
+	for status := range statuses {
+		if status != http.StatusOK {
+			t.Fatalf("concurrent upload status=%d", status)
+		}
+	}
+	pulled := request(server, http.MethodGet, "/sync/pull/ios", nil)
+	requireStatus(t, pulled, http.StatusOK)
+	if !reflect.DeepEqual([]byte(pulled.Body.String()), []byte(payloads[0])) {
+		found := false
+		for _, payload := range payloads {
+			if pulled.Body.String() == payload {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("final snapshot is an interleaved or partial payload")
+		}
+	}
+}
+
+func TestCollaborationValidationLifecycleAndContract(t *testing.T) {
+	server := testServer(t)
+	putMember(t, server, "owner", RoleOwner)
+	putMember(t, server, "viewer", RoleViewer)
+
+	badRole := jsonRequest(t, server, http.MethodPut, "/members", Member{ID: "bad", Name: "Bad", Role: Role("editor")})
+	requireStatus(t, badRole, http.StatusBadRequest)
+	if _, ok := server.collaboration.Members["bad"]; ok {
+		t.Fatal("invalid role was persisted")
+	}
+
+	branch := Branch{ID: "branch-1", Name: "Maternal", Kind: "maternal", IsSeeded: true, MemberIDs: []string{"owner", "viewer"}, CreatedAt: 123}
+	createdBranch := putBranch(t, server, branch)
+	requireStatus(t, createdBranch, http.StatusCreated)
+	returnedBranch := decodeResponse[Branch](t, createdBranch)
+	if returnedBranch.MemberIDs == nil || !returnedBranch.IsSeeded || returnedBranch.CreatedAt != 123 {
+		t.Fatalf("branch contract/fields incorrect: %+v", returnedBranch)
+	}
+	duplicateBranch := putBranch(t, server, branch)
+	requireStatus(t, duplicateBranch, http.StatusConflict)
+
+	createdFolder := putFolder(t, server, Folder{ID: "folder-1", BranchID: "branch-1", Name: "Letters", MemberIDs: []string{}, CreatedAt: 456})
+	requireStatus(t, createdFolder, http.StatusCreated)
+	returnedFolder := decodeResponse[Folder](t, createdFolder)
+	if returnedFolder.MemberIDs == nil || returnedFolder.CreatedAt != 456 {
+		t.Fatalf("folder contract/fields incorrect: %+v", returnedFolder)
+	}
+	child := putFolder(t, server, Folder{ID: "folder-2", BranchID: "branch-1", ParentID: "folder-1", Name: "Child"})
+	requireStatus(t, child, http.StatusCreated)
+	cycle := jsonRequest(t, server, http.MethodPut, "/folders/folder-1", map[string]any{"parent_id": "folder-2"})
+	requireStatus(t, cycle, http.StatusBadRequest)
+	missingBranch := putFolder(t, server, Folder{ID: "missing", BranchID: "no-such-branch", Name: "Nope"})
+	requireStatus(t, missingBranch, http.StatusBadRequest)
+	missingParent := putFolder(t, server, Folder{ID: "missing-parent", BranchID: "branch-1", ParentID: "no-such-folder", Name: "Nope"})
+	requireStatus(t, missingParent, http.StatusBadRequest)
+	wrongBranch := putBranch(t, server, Branch{ID: "branch-2", Name: "Other", Kind: "custom"})
+	requireStatus(t, wrongBranch, http.StatusCreated)
+	crossBranchParent := putFolder(t, server, Folder{ID: "cross", BranchID: "branch-2", ParentID: "folder-1", Name: "Nope"})
+	requireStatus(t, crossBranchParent, http.StatusBadRequest)
+
+	partialUpdate := jsonRequest(t, server, http.MethodPut, "/branches/branch-1", map[string]any{"name": "Renamed"})
+	requireStatus(t, partialUpdate, http.StatusOK)
+	updatedBranch := decodeResponse[Branch](t, partialUpdate)
+	if updatedBranch.Name != "Renamed" || !updatedBranch.IsSeeded || updatedBranch.CreatedAt != 123 || updatedBranch.Kind != "maternal" {
+		t.Fatalf("partial update reset immutable fields: %+v", updatedBranch)
+	}
+	nonexistentUpdate := jsonRequest(t, server, http.MethodPut, "/branches/no-such", map[string]any{"name": "fake"})
+	requireStatus(t, nonexistentUpdate, http.StatusNotFound)
+	emptyBranchUpdate := jsonRequest(t, server, http.MethodPut, "/branches/branch-1", map[string]any{})
+	requireStatus(t, emptyBranchUpdate, http.StatusBadRequest)
+	nonexistentFolderUpdate := jsonRequest(t, server, http.MethodPut, "/folders/no-such", map[string]any{"name": "fake"})
+	requireStatus(t, nonexistentFolderUpdate, http.StatusNotFound)
+	emptyFolderUpdate := jsonRequest(t, server, http.MethodPut, "/folders/folder-1", map[string]any{})
+	requireStatus(t, emptyFolderUpdate, http.StatusBadRequest)
+
+	invite := createInvite(t, server, "owner", RoleOrganizer, []string{"branch-1"}, []string{})
+	if invite.CreatedBy != "owner" || invite.Role != RoleOrganizer || invite.Code == "" {
+		t.Fatalf("invitation response did not match Swift contract: %+v", invite)
+	}
+	lookup := request(server, http.MethodGet, "/invite/"+invite.Code, nil)
+	requireStatus(t, lookup, http.StatusOK)
+	accepted := jsonRequest(t, server, http.MethodPost, "/invite/"+invite.Code, map[string]string{"member_id": "new-member", "member_name": "New Member"})
+	requireStatus(t, accepted, http.StatusOK)
+	acceptedJSON := decodeResponse[map[string]any](t, accepted)
+	if acceptedJSON["role"] != string(RoleOrganizer) {
+		t.Fatalf("accepted role=%v", acceptedJSON["role"])
+	}
+	duplicateAccept := jsonRequest(t, server, http.MethodPost, "/invite/"+invite.Code, map[string]string{"member_id": "another", "member_name": "Another"})
+	requireStatus(t, duplicateAccept, http.StatusNotFound)
+	branchAfterAccept := decodeResponse[Branch](t, request(server, http.MethodGet, "/branches/branch-1", nil))
+	if !contains(branchAfterAccept.MemberIDs, "new-member") {
+		t.Fatalf("accepted member was not granted branch access: %+v", branchAfterAccept.MemberIDs)
+	}
+
+	// Committed API v1 contract: the creator of an invitation does not need to
+	// exist as a member yet (the Swift capability probe invites a not-yet-added
+	// member), so a missing creator is not an error.
+	invalidCreator := jsonRequest(t, server, http.MethodPost, "/invite", map[string]any{"created_by": "missing", "role": RoleViewer})
+	requireStatus(t, invalidCreator, http.StatusCreated)
+	invalidInviteRole := jsonRequest(t, server, http.MethodPost, "/invite", map[string]any{"created_by": "owner", "role": "editor"})
+	requireStatus(t, invalidInviteRole, http.StatusBadRequest)
+	existingMemberInvite := createInvite(t, server, "owner", RoleViewer, nil, nil)
+	existingAccept := jsonRequest(t, server, http.MethodPost, "/invite/"+existingMemberInvite.Code, map[string]string{"member_id": "viewer", "member_name": "Viewer"})
+	requireStatus(t, existingAccept, http.StatusConflict)
+	revoked := createInvite(t, server, "owner", RoleViewer, nil, nil)
+	revokeResponse := request(server, http.MethodDelete, "/invite/"+revoked.Code, nil)
+	requireStatus(t, revokeResponse, http.StatusNoContent)
+	revokedLookup := request(server, http.MethodGet, "/invite/"+revoked.Code, nil)
+	requireStatus(t, revokedLookup, http.StatusNotFound)
+
+	expired := createInvite(t, server, "owner", RoleViewer, nil, nil)
+	server.mu.Lock()
+	stored := server.collaboration.Invitations[expired.Code]
+	stored.Expires = server.now().Add(-time.Hour).UnixMilli()
+	server.collaboration.Invitations[expired.Code] = stored
+	server.mu.Unlock()
+	expiredLookup := request(server, http.MethodGet, "/invite/"+expired.Code, nil)
+	requireStatus(t, expiredLookup, http.StatusGone)
+
+	deleteViewer := request(server, http.MethodDelete, "/members?id=viewer", nil)
+	requireStatus(t, deleteViewer, http.StatusNoContent)
+	branchAfterDelete := decodeResponse[Branch](t, request(server, http.MethodGet, "/branches/branch-1", nil))
+	if contains(branchAfterDelete.MemberIDs, "viewer") {
+		t.Fatal("deleted member left a stale branch reference")
+	}
+}
+
+func TestCascadeDeletionAndOwnerProtection(t *testing.T) {
+	server := testServer(t)
+	putMember(t, server, "owner", RoleOwner)
+	branch := Branch{ID: "branch", Name: "Branch", Kind: "custom"}
+	requireStatus(t, putBranch(t, server, branch), http.StatusCreated)
+	requireStatus(t, putFolder(t, server, Folder{ID: "root", BranchID: "branch", Name: "Root"}), http.StatusCreated)
+	requireStatus(t, putFolder(t, server, Folder{ID: "child", BranchID: "branch", ParentID: "root", Name: "Child"}), http.StatusCreated)
+	invite := createInvite(t, server, "owner", RoleViewer, []string{"branch"}, nil)
+	deleteBranch := request(server, http.MethodDelete, "/branches/branch", nil)
+	requireStatus(t, deleteBranch, http.StatusNoContent)
+	if status := request(server, http.MethodGet, "/folders/root", nil).Code; status != http.StatusNotFound {
+		t.Fatalf("root folder status=%d", status)
+	}
+	if status := request(server, http.MethodGet, "/folders/child", nil).Code; status != http.StatusNotFound {
+		t.Fatalf("child folder status=%d", status)
+	}
+	if status := request(server, http.MethodGet, "/invite/"+invite.Code, nil).Code; status != http.StatusNotFound {
+		t.Fatalf("deleted branch invitation status=%d", status)
+	}
+	deleteOwner := request(server, http.MethodDelete, "/members?id=owner", nil)
+	requireStatus(t, deleteOwner, http.StatusConflict)
+}
+
+func TestPersistenceRestartMalformedStateAndMigration(t *testing.T) {
+	dataDir := t.TempDir()
+	keys := map[string]string{"test": sha256hex([]byte(testToken))}
+	server, err := newServer(dataDir, keys, defaultLimits(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	putMember(t, server, "owner", RoleOwner)
+	requireStatus(t, putBranch(t, server, Branch{ID: "branch", Name: "Branch", Kind: "custom"}), http.StatusCreated)
+	requireStatus(t, putFolder(t, server, Folder{ID: "folder", BranchID: "branch", Name: "Folder"}), http.StatusCreated)
+
+	restarted, err := newServer(dataDir, keys, defaultLimits(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := decodeResponse[[]Member](t, request(restarted, http.MethodGet, "/members", nil))
+	if len(members) != 1 || members[0].ID != "owner" {
+		t.Fatalf("members did not survive restart: %+v", members)
+	}
+	branches := decodeResponse[[]Branch](t, request(restarted, http.MethodGet, "/branches", nil))
+	folders := decodeResponse[[]Folder](t, request(restarted, http.MethodGet, "/folders", nil))
+	if len(branches) != 1 || len(folders) != 1 {
+		t.Fatalf("family state did not survive restart: branches=%+v folders=%+v", branches, folders)
+	}
+	persisted, err := os.ReadFile(filepath.Join(dataDir, "collaboration.json"))
+	if err != nil || !bytes.Contains(persisted, []byte(`"version": 1`)) {
+		t.Fatalf("state was not versioned: %s (%v)", persisted, err)
+	}
+
+	malformedDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(malformedDir, "collaboration.json"), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newServer(malformedDir, keys, defaultLimits(), "test"); err == nil {
+		t.Fatal("malformed collaboration state did not stop startup")
+	}
+	emptyDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(emptyDir, "collaboration.json"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newServer(emptyDir, keys, defaultLimits(), "test"); err == nil {
+		t.Fatal("empty collaboration state did not stop startup")
+	}
+	nullDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(nullDir, "collaboration.json"), []byte(`{"members":null}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newServer(nullDir, keys, defaultLimits(), "test"); err == nil {
+		t.Fatal("null collaboration collection did not stop startup")
+	}
+
+	legacyDir := t.TempDir()
+	legacy := CollaborationState{
+		Members:     map[string]Member{"owner": {ID: "owner", Name: "Owner", Role: Role("editor"), Since: 100}},
+		Invitations: map[string]Invitation{},
+		Branches:    map[string]Branch{"branch": {ID: "branch", Name: "Branch", Kind: "custom", MemberIDs: []string{"owner"}, CreatedAt: 100}},
+		Folders:     map[string]Folder{},
+	}
+	legacyData, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "collaboration.json"), legacyData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := newServer(legacyDir, keys, defaultLimits(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.collaboration.Members["owner"].Role != RoleParentAdmin {
+		t.Fatalf("legacy editor was not explicitly migrated: %+v", migrated.collaboration.Members["owner"])
+	}
+	migratedData, err := os.ReadFile(filepath.Join(legacyDir, "collaboration.json"))
+	if err != nil || !bytes.Contains(migratedData, []byte(`"version": 1`)) || bytes.Contains(migratedData, []byte(`"role": "editor"`)) {
+		t.Fatalf("migration was not persisted: %s (%v)", migratedData, err)
+	}
+}
+
+func TestSaveFailureDoesNotReportSuccessOrMutateMemory(t *testing.T) {
+	server := testServer(t)
+	path := filepath.Join(server.dataDir, "collaboration.json")
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	recorder := jsonRequest(t, server, http.MethodPut, "/members", Member{ID: "owner", Name: "Owner", Role: RoleOwner})
+	requireStatus(t, recorder, http.StatusInternalServerError)
+	server.mu.RLock()
+	_, exists := server.collaboration.Members["owner"]
+	server.mu.RUnlock()
+	if exists {
+		t.Fatal("member was mutated in memory after persistence failure")
+	}
+}
+
+func TestAPIKeyParsing(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		good bool
+	}{
+		{name: "valid", data: "# comment\niphone:token-one\nandroid:token-two\n", good: true},
+		{name: "missing separator", data: "iphone-token\n", good: false},
+		{name: "blank token", data: "iphone:\n", good: false},
+		{name: "duplicate name", data: "iphone:one\niphone:two\n", good: false},
+		{name: "duplicate token", data: "iphone:one\nandroid:one\n", good: false},
+		{name: "whitespace token", data: "iphone:token with spaces\n", good: false},
+		{name: "comments only", data: "# nothing active\n\n", good: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "keys.txt")
+			if err := os.WriteFile(path, []byte(test.data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			keys, err := loadAPIKeys(path, false)
+			if test.good {
+				if err != nil || len(keys) != 2 {
+					t.Fatalf("keys=%v err=%v", keys, err)
+				}
+			} else if err == nil {
+				t.Fatalf("malformed key file accepted: %+v", keys)
+			}
+		})
+	}
+	missing, err := loadAPIKeys(filepath.Join(t.TempDir(), "missing"), false)
+	if err == nil || missing != nil {
+		t.Fatalf("missing key file fallback was not rejected: keys=%v err=%v", missing, err)
+	}
+	dev, err := loadAPIKeys(filepath.Join(t.TempDir(), "missing"), true)
+	if err != nil || len(dev) != 1 {
+		t.Fatalf("explicit development fallback failed: keys=%v err=%v", dev, err)
+	}
+}
+
+func TestDeterministicListOrdering(t *testing.T) {
+	server := testServer(t)
+	putMember(t, server, "owner", RoleOwner)
+	for _, branch := range []Branch{
+		{ID: "z-branch", Name: "Z", Kind: "custom", CreatedAt: 20},
+		{ID: "a-branch", Name: "A", Kind: "custom", CreatedAt: 10},
+	} {
+		requireStatus(t, putBranch(t, server, branch), http.StatusCreated)
+	}
+	branches := decodeResponse[[]Branch](t, request(server, http.MethodGet, "/branches", nil))
+	got := []string{branches[0].ID, branches[1].ID}
+	if !reflect.DeepEqual(got, []string{"a-branch", "z-branch"}) {
+		t.Fatalf("branch order=%v", got)
+	}
+	// The IDs are also a deterministic tie-breaker when timestamps match.
+	for _, branch := range []Branch{
+		{ID: "b-branch", Name: "B", Kind: "custom", CreatedAt: 10},
+	} {
+		requireStatus(t, putBranch(t, server, branch), http.StatusCreated)
+	}
+	branches = decodeResponse[[]Branch](t, request(server, http.MethodGet, "/branches", nil))
+	ids := []string{branches[0].ID, branches[1].ID, branches[2].ID}
+	want := append([]string(nil), ids...)
+	sort.Strings(want[0:2])
+	if ids[0] != "a-branch" || ids[1] != "b-branch" || ids[2] != "z-branch" {
+		t.Fatalf("tie ordering=%v", ids)
+	}
+}
+
+func TestJSONBodyValidation(t *testing.T) {
+	server := testServer(t)
+	invalid := request(server, http.MethodPut, "/members", strings.NewReader(`{"id":"x"} trailing`))
+	requireStatus(t, invalid, http.StatusBadRequest)
+	oversized := request(server, http.MethodPut, "/members", strings.NewReader(`{"id":"`+strings.Repeat("x", 300)+`","name":"Member","role":"viewer"}`))
+	requireStatus(t, oversized, http.StatusRequestEntityTooLarge)
+}
+
+func TestIdentifierAndBranchKindValidation(t *testing.T) {
+	for _, value := range []string{"", ".", "..", "../escape", `..\\escape`, "a/b", "a b", "é", strings.Repeat("a", 129), "-starts-with-dash"} {
+		if validIdentifier(value) {
+			t.Fatalf("unsafe identifier accepted: %q", value)
+		}
+	}
+	for _, value := range []string{"a", "A-1", "uuid_1", "attachment.jpg"} {
+		if !validIdentifier(value) {
+			t.Fatalf("safe identifier rejected: %q", value)
+		}
+	}
+	server := testServer(t)
+	putMember(t, server, "owner", RoleOwner)
+	badKind := putBranch(t, server, Branch{ID: "branch", Name: "Branch", Kind: "not-a-kind"})
+	requireStatus(t, badKind, http.StatusBadRequest)
+}
+
+func TestByteCountParsing(t *testing.T) {
+	valid := []struct {
+		text string
+		want int64
+	}{
+		{"512", 512},
+		{"1K", 1024},
+		{"2M", 2 << 20},
+		{"1G", 1 << 30},
+		{"1g", 1 << 30},
+		{" 4k ", 4 << 10},
+	}
+	for _, test := range valid {
+		got, err := parseByteCount(test.text)
+		if err != nil || got != test.want {
+			t.Fatalf("parseByteCount(%q) = %d, %v; want %d", test.text, got, err, test.want)
+		}
+	}
+	invalid := []string{"", "0", "-5", "abc", "1.5M", "1X", "999999999999999999999999G"}
+	for _, text := range invalid {
+		if _, err := parseByteCount(text); err == nil {
+			t.Fatalf("parseByteCount(%q) succeeded, want error", text)
+		}
+	}
+}
+
+func TestLimitsFromEnv(t *testing.T) {
+	// Invalid MAX_UPLOAD_BYTES must fail startup, not silently become 0.
+	t.Setenv("MAX_UPLOAD_BYTES", "not-a-number")
+	if _, err := limitsFromEnv(); err == nil {
+		t.Fatal("invalid MAX_UPLOAD_BYTES did not fail")
+	}
+	// MAX_UPLOAD_BYTES applies to upload limits but not the JSON body limit.
+	t.Setenv("MAX_UPLOAD_BYTES", "64M")
+	limits, err := limitsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits.Sync != 64<<20 || limits.Attachment != 64<<20 || limits.Backup != 64<<20 {
+		t.Fatalf("MAX_UPLOAD_BYTES not applied to upload limits: %+v", limits)
+	}
+	if limits.JSONBody != defaultJSONBodyLimit {
+		t.Fatalf("MAX_UPLOAD_BYTES must not change JSON body limit: %+v", limits)
+	}
+	// Granular variables take precedence over the shared knob.
+	t.Setenv("MAX_BACKUP_SIZE", "1G")
+	limits, err = limitsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits.Backup != 1<<30 || limits.Sync != 64<<20 {
+		t.Fatalf("granular override failed: %+v", limits)
+	}
+	// Negative and zero are rejected.
+	t.Setenv("MAX_BACKUP_SIZE", "-1")
+	if _, err := limitsFromEnv(); err == nil {
+		t.Fatal("negative MAX_BACKUP_SIZE did not fail")
+	}
+	t.Setenv("MAX_BACKUP_SIZE", "0")
+	if _, err := limitsFromEnv(); err == nil {
+		t.Fatal("zero MAX_BACKUP_SIZE did not fail")
+	}
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
