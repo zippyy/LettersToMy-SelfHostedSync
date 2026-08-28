@@ -154,7 +154,36 @@ else
   fail "sha256 mismatch"
 fi
 
-# ── 7. Wrong token → 401 + structured error ──────────────────────────
+# ── 7. Backup metadata contract ─────────────────────────────────────
+step "Backup metadata contract (letter_count)"
+META_BODY="$(curl -sf -X PUT -H "$AUTH" --data-binary @"$PAYLOAD" \
+  "$BASE/backup/push?id=integration-meta&letter_count=42")"
+if echo "$META_BODY" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("id", "timestamp", "size", "letter_count"):
+    assert k in d, (k, d)
+assert d["id"] == "integration-meta", d
+assert d["letter_count"] == 42, d
+assert d["timestamp"] > 0 and d["size"] > 0, d
+'; then
+  pass "backup push returns id/timestamp/size/letter_count"
+else
+  fail "backup push metadata (got: $META_BODY)"
+fi
+
+if curl -sf -H "$AUTH" "$BASE/backup/list" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+meta = [b for b in d if b["id"] == "integration-meta"]
+assert meta and meta[0]["letter_count"] == 42, d
+'; then
+  pass "backup list reports persisted letter_count"
+else
+  fail "backup list letter_count"
+fi
+
+# ── 8. Wrong token → 401 + structured error ──────────────────────────
 step "Authentication failure path"
 CODE="$(curl -s -o /dev/null -w '%{http_code}' \
   -H "Authorization: Bearer wrong-token" "$BASE/status")"
@@ -176,7 +205,72 @@ else
   fail "structured error body (got: $ERR_BODY)"
 fi
 
-# ── 8. Create collaboration state that must survive a restart ────────
+# ── 9. Attachment lifecycle (list + delete) ──────────────────────────
+step "Attachment list and delete"
+if curl -sf -X PUT -H "$AUTH" --data-binary @"$PAYLOAD" \
+    "$BASE/attachment/upload?id=integration-att.jpg" > /dev/null; then
+  pass "attachment upload"
+else
+  fail "attachment upload"
+fi
+
+if curl -sf -H "$AUTH" "$BASE/attachment/list" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert any(a["id"] == "integration-att.jpg" for a in d), d
+assert all("content_type" in a and "size" in a for a in d), d
+'; then
+  pass "attachment list with metadata"
+else
+  fail "attachment list with metadata"
+fi
+
+if curl -sf -H "$AUTH" "$BASE/attachment/download/integration-att.jpg" -o "$PAYLOAD_DOWN" \
+    && cmp -s "$PAYLOAD" "$PAYLOAD_DOWN"; then
+  pass "attachment download byte-identical"
+else
+  fail "attachment download byte-identical"
+fi
+
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "$AUTH" \
+  "$BASE/attachment/integration-att.jpg")"
+if [[ "$CODE" == "204" || "$CODE" == "200" ]]; then
+  pass "attachment delete"
+else
+  fail "attachment delete (got $CODE)"
+fi
+
+if curl -sf -H "$AUTH" "$BASE/attachment/list" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert not any(a["id"] == "integration-att.jpg" for a in d), d
+'; then
+  pass "attachment list reflects deletion"
+else
+  fail "attachment list reflects deletion"
+fi
+
+# ── 10. Backup delete ────────────────────────────────────────────────
+step "Backup delete"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "$AUTH" \
+  "$BASE/backup/integration-meta")"
+if [[ "$CODE" == "204" || "$CODE" == "200" ]]; then
+  pass "backup delete"
+else
+  fail "backup delete (got $CODE)"
+fi
+
+if curl -sf -H "$AUTH" "$BASE/backup/list" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert not any(b["id"] == "integration-meta" for b in d), d
+'; then
+  pass "backup list reflects deletion"
+else
+  fail "backup list reflects deletion"
+fi
+
+# ── 11. Create collaboration state that must survive a restart ───────
 step "Seed collaboration state"
 if curl -sf -X POST -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"id":"restart-branch","name":"Persistence","kind":"custom"}' \
@@ -186,7 +280,7 @@ else
   fail "branch created"
 fi
 
-# ── 9. Restart server, verify persistence ────────────────────────────
+# ── 12. Restart server, verify persistence ───────────────────────────
 step "Restart server"
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
