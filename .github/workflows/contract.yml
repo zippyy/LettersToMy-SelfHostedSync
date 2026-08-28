@@ -1,0 +1,44 @@
+name: Client-Server Contract
+
+# The executable proof that the Go server and the Swift client agree on the
+# wire contract (API v1). Any server change that breaks the client fails CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  contract:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: server
+
+      - name: Checkout compatible LettersToMy client
+        uses: actions/checkout@v4
+        with:
+          repository: zippyy/LettersToMy
+          path: client
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: server/go.mod
+
+      - name: Server unit tests
+        working-directory: server
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Server build
+        working-directory: server
+        run: go build ./...
+
+      - name: Cross-repo integration harness
+        working-directory: server
+        env:
+          LTM_CLIENT_REPO: ../client
+        run: bash scripts/integration-test.sh
