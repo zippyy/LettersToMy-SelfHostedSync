@@ -1330,8 +1330,30 @@ func (s *Server) handleBackupPush(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "backup exceeds the configured limit")
 		return
 	}
-	result, err := atomicCopy(filepath.Join(s.dataDir, "backup", id+".letterstomy"), r.Body, s.limits.Backup, 0600)
+	archivePath := filepath.Join(s.dataDir, "backup", id+".letterstomy")
+	_, archiveStatErr := os.Lstat(archivePath)
+	hadArchive := archiveStatErr == nil
+	// Commit the metadata BEFORE the archive: the archive and its sidecar
+	// are two files and cannot be renamed atomically together, so a failed
+	// metadata write must never leave a replaced archive without its
+	// letter_count (previously a 500 could silently swap the archive and
+	// drop the count to 0).
+	timestamp := s.now().UnixMilli()
+	if err := s.writeBackupMetaLocked(id, timestamp, letterCount); err != nil {
+		log.Printf("[backup] meta %s failed: %v", id, err)
+		writeError(w, http.StatusInternalServerError, "storage_failure", "unable to store backup metadata")
+		return
+	}
+	result, err := atomicCopy(archivePath, r.Body, s.limits.Backup, 0600)
 	if err != nil {
+		// The archive never landed; undo the sidecar if this was a new
+		// backup so we do not leave an orphaned metadata file. If the
+		// backup existed before, the previous archive is untouched and its
+		// previous (now stale) sidecar was already overwritten — the
+		// client saw the failure and will retry.
+		if !hadArchive {
+			_ = os.Remove(filepath.Join(s.dataDir, "backup", id+".letterstomy.meta"))
+		}
 		if errors.Is(err, errTooLarge) {
 			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "backup exceeds the configured limit")
 		} else {
@@ -1341,12 +1363,6 @@ func (s *Server) handleBackupPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result.ID = id
-	timestamp := s.now().UnixMilli()
-	if err := s.writeBackupMetaLocked(id, timestamp, letterCount); err != nil {
-		log.Printf("[backup] meta %s failed: %v", id, err)
-		writeError(w, http.StatusInternalServerError, "storage_failure", "unable to store backup metadata")
-		return
-	}
 	log.Printf("[backup] push %s size=%d sha256=%s letters=%d", id, result.Size, result.SHA256, letterCount)
 	if err := writeJSON(w, struct {
 		ID          string `json:"id"`
@@ -1419,6 +1435,10 @@ func (s *Server) handleBackupDelete(w http.ResponseWriter, r *http.Request) {
 	defer s.backupMu.Unlock()
 	if err := os.Remove(filepath.Join(s.dataDir, "backup", id+".letterstomy")); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			// Best-effort cleanup of an orphaned metadata sidecar even when
+			// the archive itself is missing (previously the 404 left it
+			// behind forever).
+			_ = os.Remove(filepath.Join(s.dataDir, "backup", id+".letterstomy.meta"))
 			writeError(w, http.StatusNotFound, "not_found", "backup not found")
 			return
 		}
@@ -1506,6 +1526,14 @@ func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request) {
 			member.Since = previous.Since
 		} else {
 			member.Since = s.now().UnixMilli()
+		}
+		// Last-owner protection applies to role changes too: otherwise
+		// the DELETE /members guard is trivially bypassed by demoting
+		// the final owner first, leaving the workspace ownerless.
+		if exists && previous.Role == RoleOwner && member.Role != RoleOwner && countOwners(next.Members) == 1 {
+			s.mu.Unlock()
+			writeError(w, http.StatusConflict, "owner_required", "the last owner cannot be demoted")
+			return
 		}
 		next.Members[member.ID] = member
 		if err := s.commitCollaborationLocked(next); err != nil {
@@ -1627,7 +1655,7 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 	invite := Invitation{
 		Code:      code,
 		CreatedBy: request.CreatedBy,
-		Role:      request.Role,
+		Role:      inviteRole,
 		BranchIDs: request.BranchIDs,
 		FolderIDs: request.FolderIDs,
 		Expires:   s.now().Add(7 * 24 * time.Hour).UnixMilli(),
