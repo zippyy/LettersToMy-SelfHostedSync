@@ -26,8 +26,12 @@ Apple clients and any other client that speaks the same API.
 
 ## Quick start
 
+The repository ships **no usable API credentials** — create a token first:
+
 ```bash
-docker compose up -d
+cp api_keys.txt api_keys.txt.local
+printf 'iphone:%s\n' "$(openssl rand -hex 32)" > api_keys.txt
+docker compose up -d --build
 ```
 
 Server listens on port 8080. In the app: **Settings → Self-Hosted Server**,
@@ -79,7 +83,7 @@ enter the server URL and the API token from `api_keys.txt`, enable, and tap
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `PUT` | `/backup/push?id=name` | Upload an archive (`id` optional in older clients; server generates one) |
+| `PUT` | `/backup/push?id=name` | Upload an archive (`id` optional; server generates one). Optional `letter_count` query param reports the number of letters inside the encrypted archive (the server cannot decrypt it; the client knows the count from its manifest) |
 | `GET` | `/backup/pull/name` | Download an archive |
 | `GET` | `/backup/list` | List stored archives (id, timestamp ms, size) |
 | `DELETE` | `/backup/name` | Delete an archive |
@@ -156,8 +160,14 @@ openssl rand -hex 32
 
 Clients send the token as `Authorization: Bearer <token>`. The file is
 mounted read-only into the container at `/etc/letters2my/api_keys.txt`
-(configurable with `API_KEYS_FILE`). Without a file, the server falls back
-to a dev-only default token `letters2my` and logs a warning.
+(configurable with `API_KEYS_FILE`).
+
+**The server refuses to start without a valid key file.** The shipped
+`api_keys.txt` is a template only — it contains no usable credentials.
+For local development only, you can allow the well-known development
+credential `letters2my` by explicitly setting `ALLOW_INSECURE_DEFAULTS=true`
+(this is off by default and never implied). In production, always generate
+strong tokens (`openssl rand -hex 32`).
 
 ## Production notes
 
