@@ -1,7 +1,5 @@
 # One key per line: device_name:token
-# Lines starting with # are comments.
-# Generate strong tokens: openssl rand -hex 32
-
-iphone:letters2my
-android:letters2my
-web:letters2my
+# Generate a strong token with: openssl rand -hex 32
+# The server intentionally refuses to start until this file has an active key.
+# Example (replace the token before starting):
+# iphone:replace-with-a-random-token
