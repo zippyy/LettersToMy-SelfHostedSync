@@ -66,10 +66,15 @@ enter the server URL and the API token from `api_keys.txt`, enable, and tap
   - `409 conflict` — duplicate member/branch/folder ID
   - `410 expired` — invitation expired (lookup or accept)
   - `413 payload_too_large` — upload exceeds the limit
-  - `422 invalid_request` — e.g. folder in a nonexistent branch
+    - `400 invalid_request` — e.g. folder in a nonexistent branch
   - `405 method_not_allowed`
   - `500 internal`
-- **Upload limit:** 512 MiB by default; set `MAX_UPLOAD_BYTES` (e.g. `1G`).
+  - **Upload limits:** defaults are 1 MiB JSON bodies, 1 GiB sync
+    snapshots, 256 MiB attachments, 1 GiB backups. Override with
+    `MAX_JSON_BODY_SIZE`, `MAX_SYNC_SIZE`, `MAX_ATTACHMENT_SIZE`,
+    `MAX_BACKUP_SIZE` (plain bytes or `K`/`M`/`G` suffixes, e.g. `1G`).
+    `MAX_UPLOAD_BYTES` remains as a legacy alias that applies to every
+    upload limit whose granular variable is not set.
 
 ## API reference
 
