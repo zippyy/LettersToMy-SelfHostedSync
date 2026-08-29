@@ -186,6 +186,121 @@ strong tokens (`openssl rand -hex 32`).
 - Back up the `data` volume — it contains every stored object.
 - Raise `MAX_UPLOAD_BYTES` if you host large media.
 
+## Health and status
+
+| Endpoint | Auth | Purpose |
+|----------|------|---------|
+| `GET /healthz` | none | Liveness probe for container orchestrators; returns `204` when the process is up. Used by the Docker healthcheck. |
+| `GET /status` | Bearer | Service identity, `api_version`, `server_version`, capabilities, counts, and listings. The client's Test Connection validates this response. |
+
+## What this server currently does — and does not
+
+Self-hosted storage currently provides:
+
+- **Encrypted remote backup storage** — opaque `.letterstomy` archives
+- **Remote backup listing, restore, and deletion**
+- **Attachment API/storage** — upload, list, download, delete
+- **Snapshot storage API** (`/sync`) — raw platform database files
+- **Collaboration-directory API** — invitations, members, branches, folders
+
+Current product boundaries (do not assume more):
+
+- This is **not** a replacement for CloudKit logical record synchronization.
+  CloudKit remains the source of truth for the LettersToMy archive; the
+  server is an add-on for backup and directory state.
+- Snapshot storage is **not** logical cross-platform letter synchronization:
+  a Core Data database cannot be swapped into an Android app or vice versa,
+  and the client never hot-swaps a live store.
+- The collaboration endpoints expose a **directory and role API**, not a
+  complete collaboration UI. There is no chat, no shared editing, and no
+  conflict resolution.
+- The server is **single-tenant / shared-state by design**. Every client
+  that holds a valid API key shares one collaboration directory and one
+  backup pool. There is no per-user isolation, multi-tenancy, or quota
+  separation.
+
+## Upgrading from an earlier build
+
+The upgrade path is deliberately simple, and old data was explicitly tested
+against this release:
+
+1. Stop the existing container/server:
+   ```bash
+   docker compose down
+   ```
+2. Back up the data volume (see Disaster recovery below). This is your
+   safety net; upgrades are tested to preserve state, but backups are cheap.
+3. Update the image/source and restart:
+   ```bash
+   git pull            # source installs, or: docker compose build --pull
+   docker compose up -d
+   ```
+4. On startup the server automatically reads supported existing state:
+   - `collaboration.json` is read, validated, and migrated to the current
+     schema version in place (legacy role values such as `editor` are
+     explicitly remapped to the current role set).
+   - Backup archives need no migration: archives are opaque encrypted
+     blobs and are read straight from the `backup/` directory.
+   - Legacy backups that predate the `letter_count` metadata sidecar remain
+     fully readable and simply report a fallback letter count of `0` in
+     listings.
+
+Downgrade compatibility is not guaranteed: after the server has rewritten
+`collaboration.json` to the current schema version, an older binary may not
+understand it. Upgrades are one-way; keep a full data backup if you might
+need to revert.
+
+## Disaster recovery
+
+The data directory (the Docker `data` volume, mounted at `/data`) is the
+**entire state of the server**. It contains:
+
+- `collaboration.json` — members, invitations, branches, folders
+- `backup/*.letterstomy` — the encrypted backup archives (the valuable part)
+- `backup/*.letterstomy.meta` — backup metadata sidecars (letter counts)
+- `attachments/*` — uploaded media blobs
+- `sync/*` — raw platform database snapshots
+- `api_keys.txt` — **not** in the volume (mounted from the host)
+
+**Back up the whole data directory.** Do not cherry-pick individual files:
+a backup archive without its sidecar still works (it just loses the letter
+count), but an archive without its directory structure, or a
+`collaboration.json` without the archives, is only a partial restore. The
+simplest reliable approach:
+
+```bash
+# With the container stopped (or a filesystem snapshot of the volume):
+docker run --rm -v letterstomy-sync-data:/data -v "$PWD":/backup \
+  alpine tar czf /backup/selfhosted-data-$(date +%F).tar.gz -C /data .
+```
+
+Restoring means replacing the whole volume contents from that archive, then
+starting the server. Also preserve:
+
+- `api_keys.txt` (or your equivalent key file) — without it the server
+  refuses to start; with it, anyone holding the file has full access.
+- Any reverse-proxy configuration that fronts the server.
+
+## Security deployment checklist
+
+- **Create a unique, strong API token** — `openssl rand -hex 32` per
+  client, and give each device its own line in the key file so keys can be
+  rotated individually.
+- **Do not use `ALLOW_INSECURE_DEFAULTS` in production.** It is a
+  development-only escape hatch (well-known credential `letters2my`); it is
+  off by default and should stay off.
+- **Terminate TLS using a trusted reverse proxy** (nginx, Caddy, Traefik)
+  in front of the server. Do not publish plaintext HTTP directly to the
+  public Internet.
+- **Back up the persistent data volume** on a schedule (see Disaster
+  recovery).
+- **Protect the API key file** — it is mounted read-only into the
+  container; on the host keep it readable only by the service account
+  (`chmod 600`).
+- **Restrict host/firewall exposure** — bind to the private interface or
+  LAN, and/or allowlist client addresses; the server has no rate limiting,
+  so exposure should be minimal.
+
 ## Docker
 
 ```bash

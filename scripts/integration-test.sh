@@ -322,6 +322,56 @@ else
   fail "collaboration state persisted across restart"
 fi
 
+# ── 13. Contract regression locks ────────────────────────────────────
+# Defects found in the adversarial review, fixed post-harness, now
+# permanently locked at the real-HTTP level (the Go unit equivalents
+# live in contract_regression_test.go):
+#   a. POST /invite with an omitted role must default to viewer
+#   b. demoting the FINAL owner must be rejected with 409 and leave
+#      the owner untouched
+step "Contract regression locks"
+
+INVITE_BODY="$(curl -sf -X POST -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"created_by":"harness-inviter"}' "$BASE/invite")"
+if echo "$INVITE_BODY" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d.get("role") == "viewer", d
+assert d.get("code"), d
+'; then
+  pass "role-less invite defaults to viewer"
+else
+  fail "role-less invite defaults to viewer (got: $INVITE_BODY)"
+fi
+
+if curl -sf -X PUT -H "$AUTH" -H "Content-Type: application/json" \
+    -d '{"id":"sole-owner","name":"Sole Owner","role":"owner"}' \
+    "$BASE/members" > /dev/null; then
+  pass "sole owner seeded"
+else
+  fail "sole owner seeded"
+fi
+
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"sole-owner","name":"Sole Owner","role":"viewer"}' "$BASE/members")"
+if [[ "$CODE" == "409" ]]; then
+  pass "final-owner demotion rejected with 409"
+else
+  fail "final-owner demotion rejected with 409 (got $CODE)"
+fi
+
+if curl -sf -H "$AUTH" "$BASE/members" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+m = [x for x in d if x["id"] == "sole-owner"]
+assert m and m[0]["role"] == "owner", d
+'; then
+  pass "owner retained after rejected demotion"
+else
+  fail "owner retained after rejected demotion"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────
 printf '\n=== INTEGRATION RESULT ===\n'
 printf 'passed: %d   failed: %d\n' "$PASSES" "$FAILURES"
