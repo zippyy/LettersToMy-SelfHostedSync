@@ -82,12 +82,14 @@ jobs:
           LTM_CLIENT_REPO: ../client
         run: bash scripts/integration-test.sh
 
-  # Current client vs the RELEASED server binary (informational): catches
-  # the case where current client main starts requiring something the
-  # released server v0.3.0 did not ship. Because origin/main == v0.3.0
-  # today this is identical to the main contract job; it exists so a future
-  # server change that needs a v0.3.1 is proven against the released
-  # client AND the released server before shipping.
+  # Current client vs the RELEASED server (informational): a genuinely
+  # distinct compatibility leg from the main contract job. This job checks
+  # out the released v0.3.0 tag (794feb4) while the main job tests current
+  # server main (e3679d2 — one commit ahead of the release). It proves
+  # users still running released v0.3.0 do not need a server update for
+  # current client changes, and it catches the case where current client
+  # main starts requiring something the released server did not ship
+  # before any future v0.3.1.
   released-server:
     runs-on: macos-latest
     steps:

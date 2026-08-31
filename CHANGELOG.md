@@ -11,7 +11,8 @@ No runtime code changes. Verified that current LettersToMy client `main`
 (`6fa3b5a`) remains fully compatible with this server (API v1) after the
 client's CloudKit-health, compact-navigation, filtering, save-failure, and
 Letter-deletion work; confirmed against released client `v0.1.0` and
-released server `v0.3.0` (`origin/main`).
+released server `v0.3.0` (tag at `794feb4`; `main` is `e3679d2`, one
+CI/docs commit ahead of the release tag).
 
 ### Added
 
