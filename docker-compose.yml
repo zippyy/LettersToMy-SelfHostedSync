@@ -1,14 +1,18 @@
 # Letters to My — Self-Hosted Sync Server
 #
-# Run: docker compose up -d
+# Run: docker compose pull && docker compose up -d
 #
 # Provides a REST API for cross-platform syncing, backup storage,
 # and attachment hosting. iOS, Android, and web clients all
 # connect to this server.
+#
+# This compose file consumes the prebuilt multi-arch image from GHCR
+# (linux/amd64 + linux/arm64) — no local build is needed. To run a local
+# source build instead, replace `image:` with `build: .`.
 
 services:
   api:
-    build: .
+    image: ghcr.io/zippyy/letterstomy-selfhostedsync:latest
     ports:
       - "8080:8080"
     volumes:

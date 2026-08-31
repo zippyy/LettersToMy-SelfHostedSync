@@ -1,0 +1,28 @@
+# Version control & CI
+.git
+.github
+.gitignore
+
+# Secrets / local config (never baked into the image)
+api_keys.txt
+.env
+.env.*
+*.pem
+*.key
+
+# Local runtime data
+data
+*.db
+*.sqlite
+*.sqlite3
+
+# Compose & docs — not part of the build context
+docker-compose*.yml
+README.md
+CHANGELOG.md
+
+# Development artifacts
+LettersToMy-SelfHostedSync
+letters2my-sync
+scripts
+*_test.go

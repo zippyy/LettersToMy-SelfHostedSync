@@ -31,8 +31,13 @@ The repository ships **no usable API credentials** — create a token first:
 ```bash
 cp api_keys.txt api_keys.txt.local
 printf 'iphone:%s\n' "$(openssl rand -hex 32)" > api_keys.txt
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+The server image is pulled from GHCR
+(`ghcr.io/zippyy/letterstomy-selfhostedsync`) — no local Go compiler or
+image build is needed.
 
 Server listens on port 8080. In the app: **Settings → Self-Hosted Server**,
 enter the server URL and the API token from `api_keys.txt`, enable, and tap
@@ -230,9 +235,10 @@ against this release:
    ```
 2. Back up the data volume (see Disaster recovery below). This is your
    safety net; upgrades are tested to preserve state, but backups are cheap.
-3. Update the image/source and restart:
+3. Update the image and restart:
    ```bash
-   git pull            # source installs, or: docker compose build --pull
+   docker compose pull       # image installs
+   # git pull                # source installs only
    docker compose up -d
    ```
 4. On startup the server automatically reads supported existing state:
@@ -303,12 +309,47 @@ starting the server. Also preserve:
 
 ## Docker
 
+Prebuilt multi-architecture images (`linux/amd64`, `linux/arm64`) are
+published to GitHub Container Registry on every push to `main` and on
+every `v*` release tag:
+
 ```bash
-docker compose up -d      # build + run on :8080
-docker compose down       # stop (volume persists)
+docker pull ghcr.io/zippyy/letterstomy-selfhostedsync:latest
 ```
 
-State lives in the named `data` volume and survives container restarts.
+### Docker Compose
+
+```bash
+# first deployment, after configuring api_keys.txt (see Quick start)
+docker compose pull
+docker compose up -d
+```
+
+Server listens on port 8080. State lives in the named `data` volume
+(mounted at `/data`) and survives container restarts.
+
+### Upgrade
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Your `/data` volume is preserved — upgrades never touch it. Back it up
+first (see Disaster recovery).
+
+### Tags
+
+| Tag | Meaning |
+|-----|---------|
+| `latest` | Most recent published build (main or latest stable release) |
+| `main` | Latest build of the `main` branch |
+| `sha-<shortsha>` | Image for a specific commit |
+| `x.y.z` / `x.y` / `x` | Semver tags for `v*` releases |
+
+For manual testing without Compose, use `docker run` directly
+(`-v ./api_keys.txt:/etc/letters2my/api_keys.txt:ro` to mount your key
+file).
 
 ## Testing
 
