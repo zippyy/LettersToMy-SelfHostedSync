@@ -126,6 +126,26 @@ else
   fail "selfhosted-check reported a failure"
 fi
 
+# ── 5b. Current-client backup E2E (real encrypted archives) ──────────
+# Uses the CURRENT client's production BackupService (AES-256-GCM archive
+# serialization) + SelfHostedAPIClient over real HTTP: letter_count
+# semantics before/after deletion, byte-identical download, restore-decode
+# of every collection, and backup deletion isolation. Only clients that
+# ship the backup-e2e product run it (the released v0.1.0 client does
+# not); older clients still get the full base contract above.
+step "Current-client backup E2E (real archives)"
+if grep -q 'backup-e2e' "$CLIENT_REPO/Package.swift"; then
+  ( cd "$CLIENT_REPO" && xcrun swift build -c release --product backup-e2e )
+  E2E="$CLIENT_REPO/.build/release/backup-e2e"
+  if "$E2E" "$BASE" "$TOKEN"; then
+    pass "backup-e2e: letter_count + deletion + restore + byte identity all PASS"
+  else
+    fail "backup-e2e reported a failure"
+  fi
+else
+  printf 'SKIP  backup-e2e (client does not ship the product)\n'
+fi
+
 # ── 6. Backup byte round trip via curl ───────────────────────────────
 step "Backup byte round trip"
 PAYLOAD="$TMP_DIR/payload.bin"

@@ -5,6 +5,36 @@ This project follows the [SemVer](https://semver.org/) conventions already
 in use by the server's `server_version` (`0.3.0`) and the shared API
 contract (API v1).
 
+## [Unreleased] — compatibility verification pass (2026-08-30)
+
+No runtime code changes. Verified that current LettersToMy client `main`
+(`6fa3b5a`) remains fully compatible with this server (API v1) after the
+client's CloudKit-health, compact-navigation, filtering, save-failure, and
+Letter-deletion work; confirmed against released client `v0.1.0` and
+released server `v0.3.0` (`origin/main`).
+
+### Added
+
+- **Released-client CI job** — `.github/workflows/contract.yml` now also
+  runs the full real-HTTP harness against the released client tag
+  (`v0.1.0`), so a future fix for current-client compatibility can never
+  silently break the released client. A third job runs current client
+  against the released server tag (`v0.3.0`) as an upgrade-compatibility
+  watch.
+- **Current-client backup E2E leg** — `scripts/integration-test.sh` now
+  builds and runs the client's `backup-e2e` product (when the checked-out
+  client ships it): real encrypted archives through production
+  `BackupService` + `SelfHostedAPIClient`, `letter_count` before/after
+  deletion, byte-identical download, restore-decode of every collection,
+  and backup deletion isolation (harness: 28 → 29 checks).
+
+### Compatibility
+
+- API: **v1** (unchanged).
+- Client: LettersToMy **v0.1.0** and current `main` — both green against
+  this server in the full real-HTTP matrix.
+- No server runtime or wire-contract changes were required.
+
 ## [0.3.0] - 2026-08-28
 
 First tagged release. Companion server for LettersToMy (client release

@@ -46,3 +46,74 @@ jobs:
         env:
           LTM_CLIENT_REPO: ../client
         run: bash scripts/integration-test.sh
+
+  # Released-client backward compatibility: the CURRENT server must keep
+  # serving the RELEASED client (v0.1.0). Runs the full harness against the
+  # tagged client; the harness skips the backup-e2e leg for clients that do
+  # not ship that product. This is the durable guard against fixing current
+  # client compatibility by breaking the released client.
+  released-client:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: server
+
+      - name: Checkout released LettersToMy client (v0.1.0)
+        uses: actions/checkout@v4
+        with:
+          repository: zippyy/LettersToMy
+          ref: v0.1.0
+          path: client
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: server/go.mod
+
+      - name: Server build
+        working-directory: server
+        run: go build ./...
+
+      - name: Cross-repo integration harness (released client)
+        working-directory: server
+        env:
+          LTM_CLIENT_REPO: ../client
+        run: bash scripts/integration-test.sh
+
+  # Current client vs the RELEASED server binary (informational): catches
+  # the case where current client main starts requiring something the
+  # released server v0.3.0 did not ship. Because origin/main == v0.3.0
+  # today this is identical to the main contract job; it exists so a future
+  # server change that needs a v0.3.1 is proven against the released
+  # client AND the released server before shipping.
+  released-server:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: server
+          ref: v0.3.0
+
+      - name: Checkout compatible LettersToMy client
+        uses: actions/checkout@v4
+        with:
+          repository: zippyy/LettersToMy
+          path: client
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: server/go.mod
+
+      - name: Server build (released v0.3.0)
+        working-directory: server
+        run: go build ./...
+
+      - name: Cross-repo integration harness (released server)
+        working-directory: server
+        env:
+          LTM_CLIENT_REPO: ../client
+        run: bash scripts/integration-test.sh
