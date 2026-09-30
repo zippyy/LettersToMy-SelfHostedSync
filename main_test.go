@@ -512,6 +512,13 @@ func TestAPIKeyParsing(t *testing.T) {
 		{name: "duplicate token", data: "iphone:one\nandroid:one\n", good: false},
 		{name: "whitespace token", data: "iphone:token with spaces\n", good: false},
 		{name: "comments only", data: "# nothing active\n\n", good: false},
+		// The shipped template's example token is public knowledge. Accepting
+		// it would leave a server trivially accessible, so it is rejected even
+		// though it is syntactically valid. Only repository-shipped placeholders
+		// are rejected — generic weak strings are a separate policy decision.
+		{name: "documented placeholder token", data: "iphone:replace-with-a-random-token\n", good: false},
+		{name: "placeholder among valid tokens", data: "iphone:token-one\nandroid:replace-with-a-random-token\n", good: false},
+		{name: "dev default credential", data: "iphone:letters2my\n", good: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

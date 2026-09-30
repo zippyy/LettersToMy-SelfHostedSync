@@ -41,6 +41,21 @@ const (
 
 var capabilities = []string{"collaboration", "backups", "attachments"}
 
+// knownInsecurePlaceholders are tokens that ship in this repository's own
+// documentation and template files. They are syntactically valid but are
+// public knowledge, so accepting one would leave a server trivially
+// accessible. Only concretely-shipped values are listed: rejecting generic
+// weak strings ("token", "secret", ...) is not this fix's job and would break
+// existing deployments without a documented compatibility boundary.
+var knownInsecurePlaceholders = map[string]bool{
+	// The literal example token in api_keys.txt and README.md.
+	"replace-with-a-random-token": true,
+	// The explicit ALLOW_INSECURE_DEFAULTS development credential. Listing it
+	// here keeps an operator from hand-writing the dev password into a real
+	// key file and believing it is a secret.
+	"letters2my": true,
+}
+
 var (
 	errTooLarge     = errors.New("request body exceeds configured limit")
 	errInvalidJSON  = errors.New("invalid JSON request body")
@@ -443,8 +458,14 @@ func loadAPIKeys(path string, allowInsecureDefaults bool) (map[string]string, er
 		if name != rawName || token != rawToken {
 			return nil, fmt.Errorf("API key line %d must not contain whitespace around name or token", lineNumber+1)
 		}
-		if !validIdentifier(name) || strings.ContainsAny(token, " \t\r\n") || token == "" {
+		if !validIdentifier(name) || strings.ContainsAny(token, " 	\r\n") || token == "" {
 			return nil, fmt.Errorf("API key line %d has an invalid name or token", lineNumber+1)
+		}
+		if knownInsecurePlaceholders[token] {
+			return nil, fmt.Errorf(
+				"API key line %d uses the documented placeholder token; generate a real token with: openssl rand -hex 32",
+				lineNumber+1,
+			)
 		}
 		if _, exists := keys[name]; exists {
 			return nil, fmt.Errorf("duplicate API key name %q on line %d", name, lineNumber+1)

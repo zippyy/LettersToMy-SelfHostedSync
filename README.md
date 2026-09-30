@@ -173,11 +173,14 @@ mounted read-only into the container at `/etc/letters2my/api_keys.txt`
 (configurable with `API_KEYS_FILE`).
 
 **The server refuses to start without a valid key file.** The shipped
-`api_keys.txt` is a template only — it contains no usable credentials.
-For local development only, you can allow the well-known development
-credential `letters2my` by explicitly setting `ALLOW_INSECURE_DEFAULTS=true`
-(this is off by default and never implied). In production, always generate
-strong tokens (`openssl rand -hex 32`).
+`api_keys.txt` is a template only — it contains no usable credentials, and its
+example value (`replace-with-a-random-token`) is **rejected even if
+uncommented**, because it is public knowledge and would leave the server
+trivially accessible. For local development only, you can allow the well-known
+development credential `letters2my` by explicitly setting
+`ALLOW_INSECURE_DEFAULTS=true` (this is off by default and never implied);
+writing that credential into a key file by hand is likewise rejected. In
+production, always generate strong tokens (`openssl rand -hex 32`).
 
 ## Production notes
 
