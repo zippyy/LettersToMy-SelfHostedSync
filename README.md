@@ -71,7 +71,7 @@ enter the server URL and the API token from `api_keys.txt`, enable, and tap
   - `409 conflict` — duplicate member/branch/folder ID
   - `410 expired` — invitation expired (lookup or accept)
   - `413 payload_too_large` — upload exceeds the limit
-    - `400 invalid_request` — e.g. folder in a nonexistent branch
+  - `400 invalid_request` — e.g. folder in a nonexistent branch
   - `405 method_not_allowed`
   - `500 internal`
   - **Upload limits:** defaults are 1 MiB JSON bodies, 1 GiB sync
@@ -132,7 +132,7 @@ invite created without a role defaults to `viewer` (least privilege).
 | `PUT` | `/branches/:id` | Update (404 when missing — no false success) |
 | `DELETE` | `/branches/:id` | Delete (cascades to its folders) |
 | `GET` | `/folders?branch_id=X` | List folders, optionally filtered |
-| `POST` | `/folders` | Create (id, name, branch_id; 422 when branch missing) |
+| `POST` | `/folders` | Create (id, name, branch_id; `400 invalid_request` when branch missing) |
 | `GET` | `/folders/:id` | Get one |
 | `PUT` | `/folders/:id` | Update (404 when missing) |
 | `DELETE` | `/folders/:id` | Delete |
